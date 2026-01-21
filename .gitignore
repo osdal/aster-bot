@@ -1,0 +1,19 @@
+﻿# env / secrets
+.env
+*.env
+
+# virtualenv
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# logs & runtime data
+logs/
+data/
