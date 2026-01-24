@@ -1,14 +1,15 @@
-﻿import os, sys, time, re, hmac, hashlib, urllib.parse, urllib.request, json, subprocess, csv, threading, queue
+import os, sys, time, re, hmac, hashlib, urllib.parse, urllib.request, json, subprocess, csv, queue, threading
 from decimal import Decimal, ROUND_DOWN
 from urllib.error import HTTPError
 from datetime import datetime, timezone
+from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# =========================
-# Config (.env)
-# =========================
+# =========================================================
+# CONFIG
+# =========================================================
 BASE = os.getenv("ASTER_REST_BASE", "https://fapi.asterdex.com").rstrip("/")
 API_KEY = os.getenv("ASTER_API_KEY")
 API_SECRET = os.getenv("ASTER_API_SECRET")
@@ -21,47 +22,56 @@ LIVE_LEVERAGE = int(os.getenv("LIVE_LEVERAGE", "2"))
 TP_PCT = Decimal(os.getenv("TP_PCT", "0.40")) / Decimal("100")
 SL_PCT = Decimal(os.getenv("SL_PCT", "0.18")) / Decimal("100")
 
-POLL_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "300"))
+POLL_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
 RECV_WINDOW = "5000"
+
+# Strategy A:
+# - PAPER counts consecutive losing trades per symbol
+# - when streak reaches N, symbol becomes "LIVE-armed"
+# - LIVE mirrors ONLY one active symbol at a time (MAX_OPEN_POSITIONS should be 1)
+LOSS_STREAK_TO_ARM = int(os.getenv("LOSS_STREAK_TO_ARM", "3"))
 
 MAX_OPEN_POSITIONS = int(os.getenv("LIVE_MAX_POSITIONS", "1"))
 
-# Вариант A: НИКАКИХ WATCH_TIMEOUT, НИКАКИХ "leave as-is".
-# Если вам нужно аварийное закрытие — это уже НЕ вариант A.
-WATCH_HARD_TIMEOUT_SEC = int(os.getenv("WATCH_HARD_TIMEOUT_SEC", "0"))
+# Timeout behavior:
+# After WATCH_PROFIT_TIMEOUT_SEC from entry:
+#   if unrealizedPnL > 0 -> close now (market reduceOnly)
+#   else -> do nothing and wait for TP/SL (no further checks)
+WATCH_PROFIT_TIMEOUT_SEC = int(os.getenv("WATCH_PROFIT_TIMEOUT_SEC", "0"))
 
-# Остановиться при "непонятном" закрытии (позиция закрылась, но TP/SL не FILLED)
-STOP_ON_UNEXPECTED_CLOSE = (os.getenv("STOP_ON_UNEXPECTED_CLOSE", "true").strip().lower() == "true")
-
-# Пропуск символов (например "BTCUSDT,ASTERUSDT")
+# Symbols to exclude from mirroring AND from arming
 SKIP_SYMBOLS = set(s.strip().upper() for s in os.getenv("SKIP_SYMBOLS", "").split(",") if s.strip())
 
-# CSV log path
 LIVE_LOG_PATH = os.getenv("LIVE_LOG_PATH", r"data\live_trades.csv")
 
-# Оценка комиссий, если userTrades недоступен (в долях от notional на сторону)
+# Fee fallback (quote currency) if userTrades is not available
 FEE_TAKER = Decimal(os.getenv("FEE_TAKER", "0.0006"))
 FEE_MAKER = Decimal(os.getenv("FEE_MAKER", "0.0002"))
 
-# Ограничение очереди сигналов OPEN, чтобы не копить бесконечно
-MAX_SIGNAL_QUEUE = int(os.getenv("MAX_SIGNAL_QUEUE", "500"))
+# Reduce API load a bit
+COUNT_POS_CACHE_SEC = float(os.getenv("COUNT_POS_CACHE_SEC", "2.0"))
 
 if not API_KEY or not API_SECRET:
     raise SystemExit("Нет ASTER_API_KEY/ASTER_API_SECRET в .env")
 
-# Вариант A — строгие инварианты
-if MAX_OPEN_POSITIONS != 1:
-    raise SystemExit("Вариант A: LIVE_MAX_POSITIONS должен быть строго 1")
-if WATCH_HARD_TIMEOUT_SEC != 0:
-    raise SystemExit("Вариант A: WATCH_HARD_TIMEOUT_SEC должен быть 0 (таймауты запрещены)")
-
+# =========================================================
+# REGEX (PAPER stdout parsing)
+# =========================================================
 OPEN_RE = re.compile(r"\[PAPER\]\s+OPEN\s+([A-Z0-9]+)\s+(LONG|SHORT)\s+entry=", re.I)
 
-# =========================
-# Helpers
-# =========================
-def utc_now_iso():
+# Example:
+# [PAPER] CLOSE SOLUSDT SHORT exit=127.52 pnl= (0.008%) reason=TIMEOUT
+# [PAPER] CLOSE ETHUSDT SHORT exit=2929 pnl= (-0.181%) reason=SL
+CLOSE_RE = re.compile(
+    r"\[PAPER\]\s+CLOSE\s+([A-Z0-9]+)\s+(LONG|SHORT)\s+exit=.*?pnl=\s*\(\s*([-\+\d\.]+)\s*%\s*\)",
+    re.I
+)
+
+# =========================================================
+# HELPERS
+# =========================================================
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def sign(params: dict) -> str:
@@ -94,45 +104,15 @@ def http_json(method, path, params=None, signed=False):
 def quantize_down(x: Decimal, step: Decimal) -> Decimal:
     return (x / step).to_integral_value(rounding=ROUND_DOWN) * step
 
-def ensure_log_header():
-    d = os.path.dirname(LIVE_LOG_PATH) or "."
-    os.makedirs(d, exist_ok=True)
-    if not os.path.exists(LIVE_LOG_PATH):
-        with open(LIVE_LOG_PATH, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "entry_ts","exit_ts","symbol","side","qty",
-                "entry_price","exit_price",
-                "gross_pnl","commission","commission_asset","net_pnl",
-                "outcome",
-                "entry_order_id","tp_order_id","sl_order_id",
-                "duration_sec","note"
-            ])
+def parse_decimal(s: str, default=Decimal("0")) -> Decimal:
+    try:
+        return Decimal(str(s).strip())
+    except Exception:
+        return default
 
-def log_live_trade(row: dict):
-    ensure_log_header()
-    with open(LIVE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            row.get("entry_ts",""),
-            row.get("exit_ts",""),
-            row.get("symbol",""),
-            row.get("side",""),
-            str(row.get("qty","")),
-            str(row.get("entry_price","")),
-            str(row.get("exit_price","")),
-            str(row.get("gross_pnl","")),
-            str(row.get("commission","")),
-            row.get("commission_asset",""),
-            str(row.get("net_pnl","")),
-            row.get("outcome",""),
-            row.get("entry_order_id",""),
-            row.get("tp_order_id",""),
-            row.get("sl_order_id",""),
-            str(row.get("duration_sec","")),
-            row.get("note",""),
-        ])
-
+# =========================================================
+# EXCHANGE/ACCOUNT QUERIES
+# =========================================================
 def get_filters(symbol: str):
     _, ex = http_json("GET", "/fapi/v1/exchangeInfo")
     sym = next((s for s in ex.get("symbols", []) if s.get("symbol") == symbol), None)
@@ -155,23 +135,27 @@ def get_positions_any():
         pass
     return []
 
-def count_open_positions():
-    pr = get_positions_any()
-    n = 0
-    for p in pr:
-        try:
-            amt = Decimal(str(p.get("positionAmt", "0") or "0"))
-            if amt != 0:
-                n += 1
-        except Exception:
-            pass
-    return n
-
-def position_amt(symbol: str) -> Decimal:
+def position_risk(symbol: str) -> dict:
     _, pr = http_json("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
     if isinstance(pr, list):
         pr = pr[0] if pr else {}
+    return pr if isinstance(pr, dict) else {}
+
+def position_amt(symbol: str) -> Decimal:
+    pr = position_risk(symbol)
     return Decimal(str(pr.get("positionAmt", "0") or "0"))
+
+def unrealized_pnl(symbol: str) -> Decimal:
+    pr = position_risk(symbol)
+    # Binance-compatible field is usually "unRealizedProfit"
+    u = pr.get("unRealizedProfit")
+    if u is None:
+        # fallback: (mark-entry)*posAmt
+        entry = parse_decimal(pr.get("entryPrice", "0"))
+        mark = parse_decimal(pr.get("markPrice", "0"))
+        amt = parse_decimal(pr.get("positionAmt", "0"))
+        return (mark - entry) * amt
+    return parse_decimal(u)
 
 def cancel_all_open_orders(symbol: str):
     http_json("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
@@ -191,86 +175,150 @@ def get_order(symbol: str, order_id: str):
     return od if isinstance(od, dict) else {}
 
 def get_user_trades(symbol: str, start_ms: int, end_ms: int):
-    _, tr = http_json(
-        "GET",
-        "/fapi/v1/userTrades",
-        {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "1000"},
-        signed=True
-    )
+    _, tr = http_json("GET", "/fapi/v1/userTrades",
+                      {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "1000"},
+                      signed=True)
     return tr if isinstance(tr, list) else []
 
-def avg_price_and_commission_from_trades(symbol: str, order_id: str, start_ms: int, end_ms: int):
-    """
-    Возвращает (avg_price, commission_sum, commission_asset).
-    Если нет данных — (None, 0, "").
-    """
+# =========================================================
+# LOGGING
+# =========================================================
+def ensure_log_header():
+    os.makedirs(os.path.dirname(LIVE_LOG_PATH) or ".", exist_ok=True)
+    if not os.path.exists(LIVE_LOG_PATH):
+        with open(LIVE_LOG_PATH, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "entry_ts","exit_ts","symbol","side","qty",
+                "entry_price","exit_price",
+                "gross_pnl","commission","net_pnl",
+                "outcome",
+                "entry_order_id","tp_order_id","sl_order_id","close_order_id",
+                "duration_sec","note"
+            ])
+
+def log_live_trade(row: dict):
+    ensure_log_header()
+    with open(LIVE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            row.get("entry_ts",""),
+            row.get("exit_ts",""),
+            row.get("symbol",""),
+            row.get("side",""),
+            str(row.get("qty","")),
+            str(row.get("entry_price","")),
+            str(row.get("exit_price","")),
+            str(row.get("gross_pnl","")),
+            str(row.get("commission","")),
+            str(row.get("net_pnl","")),
+            row.get("outcome",""),
+            row.get("entry_order_id",""),
+            row.get("tp_order_id",""),
+            row.get("sl_order_id",""),
+            row.get("close_order_id",""),
+            str(row.get("duration_sec","")),
+            row.get("note",""),
+        ])
+
+# =========================================================
+# COMMISSION & FLATTEN
+# =========================================================
+def compute_commission(symbol: str, entry_oid: str, tp_oid: str, sl_oid: str, close_oid: str,
+                       entry_ms: int, exit_ms: int,
+                       assumed_exit_is_maker: bool, qty: Decimal, entry_price: Decimal) -> Decimal:
+    # 1) Try userTrades
     try:
-        trades = get_user_trades(symbol, max(start_ms - 10_000, 0), end_ms + 10_000)
-        qty_sum = Decimal("0")
-        notional_sum = Decimal("0")
-        comm_sum = Decimal("0")
-        comm_asset = ""
+        trades = get_user_trades(symbol, max(entry_ms - 10_000, 0), exit_ms + 10_000)
+        comm = Decimal("0")
+        oids = {str(x) for x in [entry_oid, tp_oid, sl_oid, close_oid] if x}
         for t in trades:
-            if str(t.get("orderId", "")) != str(order_id):
+            oid = str(t.get("orderId", ""))
+            if oids and oid and oid not in oids:
                 continue
-            q = Decimal(str(t.get("qty", "0") or "0"))
-            p = Decimal(str(t.get("price", "0") or "0"))
-            qty_sum += q
-            notional_sum += q * p
             c = t.get("commission")
             if c is not None:
-                comm_sum += Decimal(str(c))
-                comm_asset = t.get("commissionAsset", comm_asset) or comm_asset
-        if qty_sum > 0:
-            return (notional_sum / qty_sum, comm_sum, comm_asset)
-        return (None, comm_sum, comm_asset)
+                try:
+                    comm += Decimal(str(c))
+                except Exception:
+                    pass
+        if comm != 0:
+            return comm
     except Exception:
-        return (None, Decimal("0"), "")
+        pass
 
-def estimate_commission_fallback(notional: Decimal, exit_is_maker: bool):
-    # entry MARKET => taker
-    entry_fee = notional * FEE_TAKER
-    exit_fee = notional * (FEE_MAKER if exit_is_maker else FEE_TAKER)
+    # 2) Fallback: estimate from notional
+    notional = qty * entry_price
+    entry_fee = notional * FEE_TAKER  # entry is MARKET => taker
+    exit_fee = notional * (FEE_MAKER if assumed_exit_is_maker else FEE_TAKER)
     return entry_fee + exit_fee
 
-# =========================
-# Core: Variant A (sequential TP/SL)
-# =========================
-def place_entry_and_wait_tp_sl(symbol: str, direction: str):
-    # Gates
+def flatten_position(symbol: str) -> str:
+    amt = position_amt(symbol)
+    if amt == 0:
+        cancel_all_open_orders(symbol)
+        return ""
+
+    side = "SELL" if amt > 0 else "BUY"
+    qty = abs(amt)
+
+    # Cancel bracket orders to avoid races
+    cancel_all_open_orders(symbol)
+
+    _, close = http_json(
+        "POST", "/fapi/v1/order",
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": format(qty, "f"),
+            "reduceOnly": "true",
+            "newClientOrderId": f"mirror_flatten_{int(time.time())}",
+        },
+        signed=True
+    )
+    return str(close.get("orderId", "") or "")
+
+# =========================================================
+# LIVE TRADE EXECUTION (blocks until position is closed)
+# =========================================================
+def place_entry_and_brackets(symbol: str, direction: str) -> dict:
+    """
+    Returns dict with at least:
+      net_pnl (Decimal), outcome (str), symbol (str)
+    """
+    # Safety gates
     if not (LIVE_ENABLED and MIRROR_ENABLED):
-        print("[SAFE] LIVE_ENABLED/MIRROR_ENABLED выключены. Пропуск.")
-        return
+        return {"symbol": symbol, "outcome": "SKIPPED_FLAGS", "net_pnl": Decimal("0")}
 
     if symbol in SKIP_SYMBOLS:
-        print(f"[SAFE] SKIP_SYMBOLS: {symbol}. Пропуск.")
-        return
+        return {"symbol": symbol, "outcome": "SKIPPED_SYMBOL", "net_pnl": Decimal("0")}
 
-    # Variant A: строго одна позиция в момент времени
-    if count_open_positions() >= 1:
-        # уже занято — не должны сюда попадать, т.к. очередь/лок,
-        # но на всякий случай:
-        return
+    # Ensure single position rule
+    if MAX_OPEN_POSITIONS <= 0:
+        return {"symbol": symbol, "outcome": "SKIPPED_BAD_MAXPOS", "net_pnl": Decimal("0")}
 
+    # If already in position, skip
     if position_amt(symbol) != 0:
-        return
+        return {"symbol": symbol, "outcome": "SKIPPED_ALREADY_IN_POS", "net_pnl": Decimal("0")}
 
-    # Clean
+    # Clean orders just in case
     cancel_all_open_orders(symbol)
 
     tick, step, minq = get_filters(symbol)
 
-    # Price
+    # Current price
     _, p = http_json("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
     last = Decimal(str(p.get("price")))
 
     # qty = notional*lev/price
     qty = quantize_down((LIVE_NOTIONAL_USD * Decimal(LIVE_LEVERAGE) / last), step)
 
-    # ВАЖНО: не увеличиваем до minQty (иначе риск "гигантской" сделки на дорогих инструментах).
+    # IMPORTANT: Do NOT auto-bump to minQty (could become huge for expensive symbols)
     if qty < minq:
-        print(f"[SAFE] {symbol}: qty={qty} < minQty={minq} при notional={LIVE_NOTIONAL_USD}, пропуск.")
-        return
+        msg = f"[SAFE] {symbol}: qty={qty} < minQty={minq} при notional={LIVE_NOTIONAL_USD}, пропуск."
+        print(msg)
+        return {"symbol": symbol, "outcome": "SKIPPED_MINQ", "net_pnl": Decimal("0"), "note": msg}
 
     set_leverage(symbol, LIVE_LEVERAGE)
 
@@ -291,32 +339,32 @@ def place_entry_and_wait_tp_sl(symbol: str, direction: str):
         },
         signed=True
     )
-    entry_oid = str(entry.get("orderId", ""))
-
+    entry_oid = str(entry.get("orderId", "") or "")
     time.sleep(0.5)
+
     od = get_order(symbol, entry_oid)
     if od.get("status") != "FILLED":
-        print("[SAFE] ENTRY не FILLED:", od.get("status"), "-> выходим.")
-        return
+        msg = f"[SAFE] ENTRY not FILLED: {od.get('status')}"
+        print(msg)
+        return {"symbol": symbol, "outcome": "ENTRY_NOT_FILLED", "net_pnl": Decimal("0"), "note": msg}
 
-    entry_avg = Decimal(str(od.get("avgPrice") or last))
-    print(f"[LIVE] FILLED {symbol} avg={entry_avg} executedQty={od.get('executedQty')} orderId={entry_oid}")
+    avg = Decimal(str(od.get("avgPrice") or last))
+    print(f"[LIVE] FILLED {symbol} avg={avg} executedQty={od.get('executedQty')} orderId={entry_oid}")
 
     # Brackets
     if direction == "LONG":
-        tp_price = quantize_down(entry_avg * (Decimal("1") + TP_PCT), tick)
-        sl_price = quantize_down(entry_avg * (Decimal("1") - SL_PCT), tick)
+        tp_price = quantize_down(avg * (Decimal("1") + TP_PCT), tick)
+        sl_price = quantize_down(avg * (Decimal("1") - SL_PCT), tick)
         tp_side = "SELL"
         sl_side = "SELL"
     else:
-        tp_price = quantize_down(entry_avg * (Decimal("1") - TP_PCT), tick)
-        sl_price = quantize_down(entry_avg * (Decimal("1") + SL_PCT), tick)
+        tp_price = quantize_down(avg * (Decimal("1") - TP_PCT), tick)
+        sl_price = quantize_down(avg * (Decimal("1") + SL_PCT), tick)
         tp_side = "BUY"
         sl_side = "BUY"
 
     print(f"[LIVE] BRACKETS {symbol} TP={tp_price} SL(stop)={sl_price}")
 
-    # TP: LIMIT reduceOnly=true
     _, tp = http_json(
         "POST", "/fapi/v1/order",
         {
@@ -331,9 +379,9 @@ def place_entry_and_wait_tp_sl(symbol: str, direction: str):
         },
         signed=True
     )
-    tp_oid = str(tp.get("orderId", ""))
+    tp_oid = str(tp.get("orderId", "") or "")
+    print("[LIVE] TP placed:", tp.get("status"), "orderId=", tp_oid)
 
-    # SL: STOP_MARKET closePosition=true (без quantity)
     _, sl = http_json(
         "POST", "/fapi/v1/order",
         {
@@ -346,156 +394,91 @@ def place_entry_and_wait_tp_sl(symbol: str, direction: str):
         },
         signed=True
     )
-    sl_oid = str(sl.get("orderId", ""))
-
-    print("[LIVE] TP placed:", tp.get("status"), "orderId=", tp_oid)
+    sl_oid = str(sl.get("orderId", "") or "")
     print("[LIVE] SL placed:", sl.get("status"), "orderId=", sl_oid)
 
-    # WAIT: Variant A — ждать до тех пор, пока позиция станет 0
-    print(f"[WATCH] {symbol}: waiting TP/SL close (Variant A, no timeout)...")
+    print(f"[WATCH] {symbol}: waiting position close...")
+
     t0 = time.time()
+    timeout_checked = False
+    close_oid = ""
 
     while True:
         amt = position_amt(symbol)
         if amt == 0:
             break
+
+        # Strategy timeout behavior: single check
+        if (not timeout_checked) and WATCH_PROFIT_TIMEOUT_SEC > 0 and (time.time() - t0) >= WATCH_PROFIT_TIMEOUT_SEC:
+            timeout_checked = True
+            try:
+                upnl = unrealized_pnl(symbol)
+                print(f"[WATCH] {symbol}: TIMEOUT check unrealizedPnL={upnl}")
+                if upnl > 0:
+                    print(f"[WATCH] {symbol}: TIMEOUT in profit -> close now (market reduceOnly)")
+                    close_oid = flatten_position(symbol)
+                    break
+                else:
+                    print(f"[WATCH] {symbol}: TIMEOUT in loss -> keep waiting TP/SL")
+            except Exception as e:
+                print(f"[WATCH] {symbol}: TIMEOUT check failed: {e} (continue waiting)")
+
         time.sleep(POLL_SEC)
+
+    # Cleanup leftover orders
+    oo = open_orders(symbol)
+    if oo:
+        print(f"[WATCH] {symbol}: position closed -> cancel leftover {len(oo)} orders")
+        cancel_all_open_orders(symbol)
 
     exit_ts = utc_now_iso()
     exit_ms = int(time.time() * 1000)
-    duration_sec = int(max(0, exit_ms - entry_ms) / 1000)
 
-    # Determine outcome: TP or SL must be FILLED
+    # Determine outcome & exit price
+    outcome = "UNKNOWN"
+    exit_price = Decimal("0")
+
     tp_od = get_order(symbol, tp_oid) if tp_oid else {}
     sl_od = get_order(symbol, sl_oid) if sl_oid else {}
 
-    outcome = "UNKNOWN"
-    exit_is_maker = False
-    exit_price = Decimal("0")
-    commission_asset = ""
-    commission = Decimal("0")
-
-    # Комиссия за вход (по userTrades если получится) — иначе оценка
-    entry_fill_price_ut, entry_comm_ut, entry_comm_asset = avg_price_and_commission_from_trades(
-        symbol, entry_oid, entry_ms, exit_ms
-    )
-    # entry_avg уже есть; entry_fill_price_ut используем только для комиссии
-    entry_comm = entry_comm_ut
-    if entry_comm_asset:
-        commission_asset = entry_comm_asset
-
     if tp_od.get("status") == "FILLED":
         outcome = "TP"
-        exit_is_maker = True  # лимитка чаще maker, но зависит от исполнения
-        # пробуем userTrades точный avg
-        ex_avg_ut, ex_comm_ut, ex_comm_asset = avg_price_and_commission_from_trades(symbol, tp_oid, entry_ms, exit_ms)
-        if ex_avg_ut is not None:
-            exit_price = ex_avg_ut
-        else:
-            ep = tp_od.get("avgPrice") or tp_od.get("price")
-            exit_price = Decimal(str(ep or "0"))
-        commission += ex_comm_ut
-        if ex_comm_asset:
-            commission_asset = ex_comm_asset or commission_asset
-
+        ep = tp_od.get("avgPrice") or tp_od.get("price")
+        exit_price = Decimal(str(ep or "0"))
+        assumed_exit_is_maker = True
     elif sl_od.get("status") == "FILLED":
         outcome = "SL"
-        exit_is_maker = False
-        ex_avg_ut, ex_comm_ut, ex_comm_asset = avg_price_and_commission_from_trades(symbol, sl_oid, entry_ms, exit_ms)
-        if ex_avg_ut is not None:
-            exit_price = ex_avg_ut
-        else:
-            ep = sl_od.get("avgPrice") or sl_od.get("price")
-            exit_price = Decimal(str(ep or "0"))
-        commission += ex_comm_ut
-        if ex_comm_asset:
-            commission_asset = ex_comm_asset or commission_asset
-
+        ep = sl_od.get("avgPrice") or sl_od.get("price") or sl_od.get("stopPrice")
+        exit_price = Decimal(str(ep or "0"))
+        assumed_exit_is_maker = False
+    elif close_oid:
+        outcome = "TIMEOUT_PROFIT_CLOSE"
+        cl = get_order(symbol, close_oid)
+        ep = cl.get("avgPrice") or cl.get("price")
+        exit_price = Decimal(str(ep or "0"))
+        assumed_exit_is_maker = False
     else:
-        # Позиция закрылась, но TP/SL не FILLED => это нарушение инварианта Variant A.
-        note = f"Position closed but TP/SL not FILLED. tp={tp_od.get('status')} sl={sl_od.get('status')}"
-        print(f"[ALERT] {symbol}: {note}")
-
-        # Чистим хвостовые ордера (если остались)
-        try:
-            oo = open_orders(symbol)
-            if oo:
-                cancel_all_open_orders(symbol)
-        except Exception:
-            pass
-
-        # Логируем как ошибку с приблизительной ценой last (только чтобы запись была)
+        # Fallback: last price
         _, p2 = http_json("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
         exit_price = Decimal(str(p2.get("price") or "0"))
-        outcome = "UNEXPECTED_CLOSE"
+        assumed_exit_is_maker = False
 
-        # комиссия (если userTrades есть — попробуем суммарно за окно; иначе fallback)
-        try:
-            # суммируем все комиссии по userTrades в окне
-            trades = get_user_trades(symbol, max(entry_ms - 10_000, 0), exit_ms + 10_000)
-            comm_sum = Decimal("0")
-            for t in trades:
-                c = t.get("commission")
-                if c is None:
-                    continue
-                comm_sum += Decimal(str(c))
-                commission_asset = t.get("commissionAsset", commission_asset) or commission_asset
-            commission = comm_sum
-        except Exception:
-            notional = qty * entry_avg
-            commission = estimate_commission_fallback(notional, exit_is_maker=False)
-            commission_asset = "USDT_EST"
+    # Gross PnL
+    if direction == "LONG":
+        gross = (exit_price - avg) * qty
+    else:
+        gross = (avg - exit_price) * qty
 
-        gross = (exit_price - entry_avg) * qty if direction == "LONG" else (entry_avg - exit_price) * qty
-        net = gross - commission
-
-        log_live_trade({
-            "entry_ts": entry_ts,
-            "exit_ts": exit_ts,
-            "symbol": symbol,
-            "side": direction,
-            "qty": qty,
-            "entry_price": entry_avg,
-            "exit_price": exit_price,
-            "gross_pnl": gross,
-            "commission": commission,
-            "commission_asset": commission_asset,
-            "net_pnl": net,
-            "outcome": outcome,
-            "entry_order_id": entry_oid,
-            "tp_order_id": tp_oid,
-            "sl_order_id": sl_oid,
-            "duration_sec": duration_sec,
-            "note": note,
-        })
-
-        print(f"[WATCH] {symbol}: LOGGED -> {LIVE_LOG_PATH} outcome={outcome} netPnL={net}")
-
-        if STOP_ON_UNEXPECTED_CLOSE:
-            raise RuntimeError(f"Variant A violated: {note}")
-        # иначе просто выходим (но это уже мягче, чем Variant A по духу)
-        return
-
-    # Cleanup leftover orders
-    try:
-        oo = open_orders(symbol)
-        if oo:
-            print(f"[WATCH] {symbol}: position closed -> cancel leftover {len(oo)} orders")
-            cancel_all_open_orders(symbol)
-    except Exception:
-        pass
-
-    # Commission: если userTrades по выходу не дали комиссию (0), то fallback
-    commission += entry_comm
-
-    if commission == 0:
-        notional = qty * entry_avg
-        commission = estimate_commission_fallback(notional, exit_is_maker=exit_is_maker)
-        commission_asset = "USDT_EST"
-
-    # Gross/Net PnL
-    gross = (exit_price - entry_avg) * qty if direction == "LONG" else (entry_avg - exit_price) * qty
+    # Commission
+    commission = compute_commission(
+        symbol, entry_oid, tp_oid, sl_oid, close_oid,
+        entry_ms, exit_ms,
+        assumed_exit_is_maker=assumed_exit_is_maker,
+        qty=qty, entry_price=avg
+    )
     net = gross - commission
+
+    duration_sec = int(max(0, exit_ms - entry_ms) / 1000)
 
     log_live_trade({
         "entry_ts": entry_ts,
@@ -503,16 +486,16 @@ def place_entry_and_wait_tp_sl(symbol: str, direction: str):
         "symbol": symbol,
         "side": direction,
         "qty": qty,
-        "entry_price": entry_avg,
+        "entry_price": avg,
         "exit_price": exit_price,
         "gross_pnl": gross,
         "commission": commission,
-        "commission_asset": commission_asset,
         "net_pnl": net,
         "outcome": outcome,
         "entry_order_id": entry_oid,
         "tp_order_id": tp_oid,
         "sl_order_id": sl_oid,
+        "close_order_id": close_oid,
         "duration_sec": duration_sec,
         "note": "",
     })
@@ -521,10 +504,73 @@ def place_entry_and_wait_tp_sl(symbol: str, direction: str):
     print(f"[WATCH] {symbol}: DONE. Cooldown {COOLDOWN_SEC}s")
     time.sleep(COOLDOWN_SEC)
 
-# =========================
-# IO Thread: read PAPER stdout continuously
-# =========================
-def stdout_reader(proc, sig_q: queue.Queue, stop_event: threading.Event):
+    return {"symbol": symbol, "outcome": outcome, "net_pnl": net}
+
+# =========================================================
+# PAPER -> LIVE COORDINATION (Strategy A)
+# =========================================================
+paper_open_events = queue.Queue()  # (symbol, direction, ts)
+loss_streak = defaultdict(int)
+
+armed_queue = deque()          # symbols armed for LIVE (FIFO)
+active_symbol = None           # current LIVE focus symbol
+
+state_lock = threading.Lock()
+stop_event = threading.Event()
+
+# Cached count_open_positions
+_last_pos_count_t = 0.0
+_last_pos_count_v = 0
+
+def count_open_positions_cached() -> int:
+    global _last_pos_count_t, _last_pos_count_v
+    now = time.time()
+    if (now - _last_pos_count_t) < COUNT_POS_CACHE_SEC:
+        return _last_pos_count_v
+    pr = get_positions_any()
+    n = 0
+    for p in pr:
+        try:
+            amt = Decimal(str(p.get("positionAmt", "0") or "0"))
+            if amt != 0:
+                n += 1
+        except Exception:
+            pass
+    _last_pos_count_t = now
+    _last_pos_count_v = n
+    return n
+
+def arm_symbol(symbol: str):
+    global active_symbol
+    if symbol in SKIP_SYMBOLS:
+        return
+    with state_lock:
+        if symbol == active_symbol:
+            return
+        if symbol in armed_queue:
+            return
+        armed_queue.append(symbol)
+        print(f"[ARM] {symbol} armed for LIVE (paper loss-streak >= {LOSS_STREAK_TO_ARM}). Queue={list(armed_queue)}")
+
+def handle_paper_close(symbol: str, pnl_pct: Decimal):
+    # Update streak
+    if pnl_pct < 0:
+        loss_streak[symbol] += 1
+    else:
+        loss_streak[symbol] = 0
+
+    st = loss_streak[symbol]
+    print(f"[STREAK] {symbol}: paper pnl%={pnl_pct} streak={st}")
+
+    # Arm on threshold
+    if st >= LOSS_STREAK_TO_ARM:
+        arm_symbol(symbol)
+
+def paper_reader_thread(proc: subprocess.Popen):
+    """
+    Continuously reads PAPER stdout so its pipe does not block.
+    Extracts OPEN/CLOSE events.
+    """
     try:
         for raw in proc.stdout:
             if stop_event.is_set():
@@ -532,81 +578,117 @@ def stdout_reader(proc, sig_q: queue.Queue, stop_event: threading.Event):
             line = raw.rstrip("\n")
             print(line)
 
-            m = OPEN_RE.search(line)
-            if m:
-                symbol = m.group(1).upper()
-                direction = m.group(2).upper()
+            # CLOSE event -> update streak & possibly arm
+            mcl = CLOSE_RE.search(line)
+            if mcl:
+                sym = mcl.group(1).upper()
+                if sym not in SKIP_SYMBOLS:
+                    pnl_pct = parse_decimal(mcl.group(3), default=Decimal("0"))
+                    handle_paper_close(sym, pnl_pct)
+                continue
 
-                # В очередь — но ограничиваем размер
-                if sig_q.qsize() >= MAX_SIGNAL_QUEUE:
-                    print(f"[MIRROR] SIGNAL QUEUE FULL ({MAX_SIGNAL_QUEUE}), drop: {symbol} {direction}")
-                    continue
-
-                sig_q.put((time.time(), symbol, direction))
+            # OPEN event -> enqueue (worker decides whether to mirror)
+            mop = OPEN_RE.search(line)
+            if mop:
+                sym = mop.group(1).upper()
+                direction = mop.group(2).upper()
+                paper_open_events.put((sym, direction, time.time()))
     except Exception as e:
-        print("[MIRROR] stdout_reader error:", e)
+        print(f"[PAPER] reader error: {e}")
+    finally:
+        stop_event.set()
 
-# =========================
-# Main loop: sequential processing (Variant A)
-# =========================
+def live_worker_thread():
+    """
+    Chooses active symbol from armed_queue and mirrors ONLY that symbol's OPENs
+    until first positive LIVE trade (net_pnl > 0). Then deactivates and moves on.
+    """
+    global active_symbol
+
+    while not stop_event.is_set():
+        # Ensure we have an active symbol
+        with state_lock:
+            if active_symbol is None and armed_queue:
+                active_symbol = armed_queue[0]
+                print(f"[LIVE-FOCUS] Active symbol set to {active_symbol} (from queue)")
+
+        # If none armed -> wait
+        if active_symbol is None:
+            time.sleep(0.5)
+            continue
+
+        # Enforce MAX_OPEN_POSITIONS=1 (recommended)
+        if count_open_positions_cached() >= MAX_OPEN_POSITIONS:
+            time.sleep(0.5)
+            continue
+
+        # Wait for paper OPEN events
+        try:
+            sym, direction, _ts = paper_open_events.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        # Mirror only current active symbol
+        if sym != active_symbol:
+            continue
+
+        # Execute LIVE trade (blocking until closed/timeout-profit-close)
+        try:
+            res = place_entry_and_brackets(sym, direction)
+        except Exception as e:
+            print(f"[LIVE] ERROR while mirroring {sym}: {e}")
+            continue
+
+        net = res.get("net_pnl", Decimal("0"))
+        try:
+            net = Decimal(str(net))
+        except Exception:
+            net = Decimal("0")
+
+        # If first positive live trade -> deactivate symbol and reset its paper streak
+        if net > 0:
+            with state_lock:
+                print(f"[LIVE-FOCUS] {active_symbol}: got positive LIVE trade (netPnL={net}) -> deactivate")
+                loss_streak[active_symbol] = 0  # start a new paper streak cycle
+                if armed_queue and armed_queue[0] == active_symbol:
+                    armed_queue.popleft()
+                else:
+                    # defensive removal
+                    try:
+                        armed_queue.remove(active_symbol)
+                    except Exception:
+                        pass
+                active_symbol = None
+
 def main():
-    print("[MIRROR] Starting PAPER -> LIVE mirror (Variant A)")
+    print("[MIRROR] Strategy A: PAPER loss-streak -> arm symbol -> LIVE until first netPnL>0")
     print("[MIRROR] Flags: LIVE_ENABLED=", LIVE_ENABLED, "MIRROR_ENABLED=", MIRROR_ENABLED)
     print("[MIRROR] Live: notional_usd=", LIVE_NOTIONAL_USD, "lev=", LIVE_LEVERAGE, "TP%=", TP_PCT*100, "SL%=", SL_PCT*100)
     print("[MIRROR] Live log:", LIVE_LOG_PATH)
+    print("[MIRROR] LOSS_STREAK_TO_ARM=", LOSS_STREAK_TO_ARM, "MAX_OPEN_POSITIONS=", MAX_OPEN_POSITIONS)
+    print("[MIRROR] WATCH_PROFIT_TIMEOUT_SEC=", WATCH_PROFIT_TIMEOUT_SEC)
     if SKIP_SYMBOLS:
         print("[MIRROR] SKIP_SYMBOLS:", ",".join(sorted(SKIP_SYMBOLS)))
 
-    # Start paper bot
+    # Start PAPER bot and reader thread
     cmd = [sys.executable, "-u", "run_paper.py"]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
-    sig_q = queue.Queue()
-    stop_event = threading.Event()
-
-    t = threading.Thread(target=stdout_reader, args=(p, sig_q, stop_event), daemon=True)
-    t.start()
+    t_reader = threading.Thread(target=paper_reader_thread, args=(proc,), daemon=True)
+    t_live = threading.Thread(target=live_worker_thread, daemon=True)
+    t_reader.start()
+    t_live.start()
 
     try:
-        # Sequential worker loop
-        while True:
-            # Если процесс paper умер — выходим
-            if p.poll() is not None:
-                raise RuntimeError(f"run_paper.py stopped with code {p.returncode}")
-
-            # Если уже есть открытая позиция (вдруг руками) — Variant A ждёт, ничего не открывает
-            if count_open_positions() >= 1:
-                time.sleep(1.0)
-                continue
-
-            # Ждём сигнал
-            try:
-                _, symbol, direction = sig_q.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            # Перед исполнением ещё раз проверка: Variant A
-            if count_open_positions() >= 1:
-                # не должны сюда попадать, но ок
-                continue
-
-            if symbol in SKIP_SYMBOLS:
-                print(f"[SAFE] SKIP_SYMBOLS: {symbol}. Пропуск.")
-                continue
-
-            try:
-                place_entry_and_wait_tp_sl(symbol, direction)
-            except Exception as e:
-                print("[MIRROR] ERROR:", e)
-                if STOP_ON_UNEXPECTED_CLOSE:
-                    raise
-
+        # Keep main thread alive; Ctrl+C will stop
+        while not stop_event.is_set():
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        print("\n[MIRROR] Stop requested (Ctrl+C).")
+        print("[MIRROR] Ctrl+C -> stopping...")
     finally:
         stop_event.set()
         try:
-            p.terminate()
+            proc.terminate()
         except Exception:
             pass
 
