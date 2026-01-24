@@ -1,4 +1,4 @@
-﻿import os, sys, time, re, hmac, hashlib, urllib.parse, urllib.request, json, subprocess, csv
+﻿import os, sys, time, re, hmac, hashlib, urllib.parse, urllib.request, json, subprocess, csv, threading, queue
 from decimal import Decimal, ROUND_DOWN
 from urllib.error import HTTPError
 from datetime import datetime, timezone
@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
+# =========================
+# Config (.env)
+# =========================
 BASE = os.getenv("ASTER_REST_BASE", "https://fapi.asterdex.com").rstrip("/")
 API_KEY = os.getenv("ASTER_API_KEY")
 API_SECRET = os.getenv("ASTER_API_SECRET")
@@ -18,29 +21,46 @@ LIVE_LEVERAGE = int(os.getenv("LIVE_LEVERAGE", "2"))
 TP_PCT = Decimal(os.getenv("TP_PCT", "0.40")) / Decimal("100")
 SL_PCT = Decimal(os.getenv("SL_PCT", "0.18")) / Decimal("100")
 
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "300"))
 POLL_SEC = float(os.getenv("WATCH_POLL_SEC", "2.0"))
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "300"))
 RECV_WINDOW = "5000"
+
 MAX_OPEN_POSITIONS = int(os.getenv("LIVE_MAX_POSITIONS", "1"))
 
-# Если поставить >0 — по таймауту форсируем закрытие позиции (market reduceOnly) и чистим ордера.
+# Вариант A: НИКАКИХ WATCH_TIMEOUT, НИКАКИХ "leave as-is".
+# Если вам нужно аварийное закрытие — это уже НЕ вариант A.
 WATCH_HARD_TIMEOUT_SEC = int(os.getenv("WATCH_HARD_TIMEOUT_SEC", "0"))
 
-# Список символов, которые не зеркалим в LIVE
+# Остановиться при "непонятном" закрытии (позиция закрылась, но TP/SL не FILLED)
+STOP_ON_UNEXPECTED_CLOSE = (os.getenv("STOP_ON_UNEXPECTED_CLOSE", "true").strip().lower() == "true")
+
+# Пропуск символов (например "BTCUSDT,ASTERUSDT")
 SKIP_SYMBOLS = set(s.strip().upper() for s in os.getenv("SKIP_SYMBOLS", "").split(",") if s.strip())
 
+# CSV log path
 LIVE_LOG_PATH = os.getenv("LIVE_LOG_PATH", r"data\live_trades.csv")
 
-# Оценка комиссий, если userTrades недоступен (в % от notional за одну сторону)
-# Например: taker 0.06% => 0.0006 ; maker 0.02% => 0.0002
+# Оценка комиссий, если userTrades недоступен (в долях от notional на сторону)
 FEE_TAKER = Decimal(os.getenv("FEE_TAKER", "0.0006"))
 FEE_MAKER = Decimal(os.getenv("FEE_MAKER", "0.0002"))
+
+# Ограничение очереди сигналов OPEN, чтобы не копить бесконечно
+MAX_SIGNAL_QUEUE = int(os.getenv("MAX_SIGNAL_QUEUE", "500"))
 
 if not API_KEY or not API_SECRET:
     raise SystemExit("Нет ASTER_API_KEY/ASTER_API_SECRET в .env")
 
+# Вариант A — строгие инварианты
+if MAX_OPEN_POSITIONS != 1:
+    raise SystemExit("Вариант A: LIVE_MAX_POSITIONS должен быть строго 1")
+if WATCH_HARD_TIMEOUT_SEC != 0:
+    raise SystemExit("Вариант A: WATCH_HARD_TIMEOUT_SEC должен быть 0 (таймауты запрещены)")
+
 OPEN_RE = re.compile(r"\[PAPER\]\s+OPEN\s+([A-Z0-9]+)\s+(LONG|SHORT)\s+entry=", re.I)
 
+# =========================
+# Helpers
+# =========================
 def utc_now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -75,16 +95,17 @@ def quantize_down(x: Decimal, step: Decimal) -> Decimal:
     return (x / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 def ensure_log_header():
-    os.makedirs(os.path.dirname(LIVE_LOG_PATH) or ".", exist_ok=True)
+    d = os.path.dirname(LIVE_LOG_PATH) or "."
+    os.makedirs(d, exist_ok=True)
     if not os.path.exists(LIVE_LOG_PATH):
         with open(LIVE_LOG_PATH, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
                 "entry_ts","exit_ts","symbol","side","qty",
                 "entry_price","exit_price",
-                "gross_pnl","commission","net_pnl",
+                "gross_pnl","commission","commission_asset","net_pnl",
                 "outcome",
-                "entry_order_id","tp_order_id","sl_order_id","close_order_id",
+                "entry_order_id","tp_order_id","sl_order_id",
                 "duration_sec","note"
             ])
 
@@ -102,12 +123,12 @@ def log_live_trade(row: dict):
             str(row.get("exit_price","")),
             str(row.get("gross_pnl","")),
             str(row.get("commission","")),
+            row.get("commission_asset",""),
             str(row.get("net_pnl","")),
             row.get("outcome",""),
             row.get("entry_order_id",""),
             row.get("tp_order_id",""),
             row.get("sl_order_id",""),
-            row.get("close_order_id",""),
             str(row.get("duration_sec","")),
             row.get("note",""),
         ])
@@ -170,71 +191,53 @@ def get_order(symbol: str, order_id: str):
     return od if isinstance(od, dict) else {}
 
 def get_user_trades(symbol: str, start_ms: int, end_ms: int):
-    # Если у Aster этот эндпоинт совместим с Binance — будет работать
-    _, tr = http_json("GET", "/fapi/v1/userTrades",
-                      {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "1000"},
-                      signed=True)
-    return tr if isinstance(tr, list) else []
-
-def compute_commission(symbol: str, entry_oid: str, tp_oid: str, sl_oid: str, close_oid: str,
-                       entry_ms: int, exit_ms: int,
-                       assumed_exit_is_maker: bool, qty: Decimal, entry_price: Decimal):
-    # 1) Пробуем userTrades
-    try:
-        trades = get_user_trades(symbol, max(entry_ms - 10_000, 0), exit_ms + 10_000)
-        comm = Decimal("0")
-        # Если есть orderId — фильтруем по ним
-        oids = {str(x) for x in [entry_oid, tp_oid, sl_oid, close_oid] if x}
-        for t in trades:
-            oid = str(t.get("orderId", ""))
-            if oids and oid and oid not in oids:
-                continue
-            c = t.get("commission")
-            if c is not None:
-                try:
-                    comm += Decimal(str(c))
-                except Exception:
-                    pass
-        if comm != 0:
-            return comm
-    except Exception:
-        pass
-
-    # 2) Фоллбек: оценка по notional и ставкам
-    # entry всегда MARKET => taker
-    notional = qty * entry_price
-    entry_fee = notional * FEE_TAKER
-    exit_fee = notional * (FEE_MAKER if assumed_exit_is_maker else FEE_TAKER)
-    return (entry_fee + exit_fee)
-
-def flatten_position(symbol: str):
-    amt = position_amt(symbol)
-    if amt == 0:
-        cancel_all_open_orders(symbol)
-        return None
-
-    side = "SELL" if amt > 0 else "BUY"
-    qty = abs(amt)
-
-    # Чистим ордера, чтобы не было гонок TP/SL
-    cancel_all_open_orders(symbol)
-
-    st, close = http_json(
-        "POST", "/fapi/v1/order",
-        {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": format(qty, "f"),
-            "reduceOnly": "true",
-            "newClientOrderId": f"mirror_flatten_{int(time.time())}",
-        },
+    _, tr = http_json(
+        "GET",
+        "/fapi/v1/userTrades",
+        {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "1000"},
         signed=True
     )
-    return close.get("orderId")
+    return tr if isinstance(tr, list) else []
 
-def place_entry_and_brackets(symbol: str, direction: str):
-    # Safety gates
+def avg_price_and_commission_from_trades(symbol: str, order_id: str, start_ms: int, end_ms: int):
+    """
+    Возвращает (avg_price, commission_sum, commission_asset).
+    Если нет данных — (None, 0, "").
+    """
+    try:
+        trades = get_user_trades(symbol, max(start_ms - 10_000, 0), end_ms + 10_000)
+        qty_sum = Decimal("0")
+        notional_sum = Decimal("0")
+        comm_sum = Decimal("0")
+        comm_asset = ""
+        for t in trades:
+            if str(t.get("orderId", "")) != str(order_id):
+                continue
+            q = Decimal(str(t.get("qty", "0") or "0"))
+            p = Decimal(str(t.get("price", "0") or "0"))
+            qty_sum += q
+            notional_sum += q * p
+            c = t.get("commission")
+            if c is not None:
+                comm_sum += Decimal(str(c))
+                comm_asset = t.get("commissionAsset", comm_asset) or comm_asset
+        if qty_sum > 0:
+            return (notional_sum / qty_sum, comm_sum, comm_asset)
+        return (None, comm_sum, comm_asset)
+    except Exception:
+        return (None, Decimal("0"), "")
+
+def estimate_commission_fallback(notional: Decimal, exit_is_maker: bool):
+    # entry MARKET => taker
+    entry_fee = notional * FEE_TAKER
+    exit_fee = notional * (FEE_MAKER if exit_is_maker else FEE_TAKER)
+    return entry_fee + exit_fee
+
+# =========================
+# Core: Variant A (sequential TP/SL)
+# =========================
+def place_entry_and_wait_tp_sl(symbol: str, direction: str):
+    # Gates
     if not (LIVE_ENABLED and MIRROR_ENABLED):
         print("[SAFE] LIVE_ENABLED/MIRROR_ENABLED выключены. Пропуск.")
         return
@@ -243,31 +246,30 @@ def place_entry_and_brackets(symbol: str, direction: str):
         print(f"[SAFE] SKIP_SYMBOLS: {symbol}. Пропуск.")
         return
 
-    # лимит позиций
-    npos = count_open_positions()
-    if npos >= MAX_OPEN_POSITIONS:
-        # Чтобы не спамить — просто пропускаем без шума
+    # Variant A: строго одна позиция в момент времени
+    if count_open_positions() >= 1:
+        # уже занято — не должны сюда попадать, т.к. очередь/лок,
+        # но на всякий случай:
         return
 
-    # уже есть позиция по символу
     if position_amt(symbol) != 0:
         return
 
-    # чистим хвосты
+    # Clean
     cancel_all_open_orders(symbol)
 
     tick, step, minq = get_filters(symbol)
 
-    # текущая цена
+    # Price
     _, p = http_json("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
     last = Decimal(str(p.get("price")))
 
     # qty = notional*lev/price
     qty = quantize_down((LIVE_NOTIONAL_USD * Decimal(LIVE_LEVERAGE) / last), step)
 
-    # ВАЖНО: НЕ увеличиваем до minQty — иначе сделка может стать гигантской (BTC) и дать -2019.
+    # ВАЖНО: не увеличиваем до minQty (иначе риск "гигантской" сделки на дорогих инструментах).
     if qty < minq:
-        print(f"[SAFE] {symbol}: qty={qty} < minQty={minq} при notional={LIVE_NOTIONAL_USD}, пропуск символа.")
+        print(f"[SAFE] {symbol}: qty={qty} < minQty={minq} при notional={LIVE_NOTIONAL_USD}, пропуск.")
         return
 
     set_leverage(symbol, LIVE_LEVERAGE)
@@ -278,7 +280,7 @@ def place_entry_and_brackets(symbol: str, direction: str):
 
     print(f"[LIVE] ENTRY {symbol} {direction} market side={side_entry} qty={qty} last={last}")
 
-    st, entry = http_json(
+    _, entry = http_json(
         "POST", "/fapi/v1/order",
         {
             "symbol": symbol,
@@ -290,32 +292,32 @@ def place_entry_and_brackets(symbol: str, direction: str):
         signed=True
     )
     entry_oid = str(entry.get("orderId", ""))
-    time.sleep(0.5)
 
+    time.sleep(0.5)
     od = get_order(symbol, entry_oid)
     if od.get("status") != "FILLED":
-        print("[SAFE] ENTRY не FILLED:", od.get("status"), "-> выходим без bracket.")
+        print("[SAFE] ENTRY не FILLED:", od.get("status"), "-> выходим.")
         return
 
-    avg = Decimal(str(od.get("avgPrice") or last))
-    print(f"[LIVE] FILLED {symbol} avg={avg} executedQty={od.get('executedQty')} orderId={entry_oid}")
+    entry_avg = Decimal(str(od.get("avgPrice") or last))
+    print(f"[LIVE] FILLED {symbol} avg={entry_avg} executedQty={od.get('executedQty')} orderId={entry_oid}")
 
-    # brackets
+    # Brackets
     if direction == "LONG":
-        tp_price = quantize_down(avg * (Decimal("1") + TP_PCT), tick)
-        sl_price = quantize_down(avg * (Decimal("1") - SL_PCT), tick)
+        tp_price = quantize_down(entry_avg * (Decimal("1") + TP_PCT), tick)
+        sl_price = quantize_down(entry_avg * (Decimal("1") - SL_PCT), tick)
         tp_side = "SELL"
         sl_side = "SELL"
     else:
-        tp_price = quantize_down(avg * (Decimal("1") - TP_PCT), tick)
-        sl_price = quantize_down(avg * (Decimal("1") + SL_PCT), tick)
+        tp_price = quantize_down(entry_avg * (Decimal("1") - TP_PCT), tick)
+        sl_price = quantize_down(entry_avg * (Decimal("1") + SL_PCT), tick)
         tp_side = "BUY"
         sl_side = "BUY"
 
     print(f"[LIVE] BRACKETS {symbol} TP={tp_price} SL(stop)={sl_price}")
 
-    # TP LIMIT reduceOnly=true
-    st, tp = http_json(
+    # TP: LIMIT reduceOnly=true
+    _, tp = http_json(
         "POST", "/fapi/v1/order",
         {
             "symbol": symbol,
@@ -330,10 +332,9 @@ def place_entry_and_brackets(symbol: str, direction: str):
         signed=True
     )
     tp_oid = str(tp.get("orderId", ""))
-    print("[LIVE] TP placed:", tp.get("status"), "orderId=", tp_oid)
 
-    # SL STOP_MARKET closePosition=true
-    st, sl = http_json(
+    # SL: STOP_MARKET closePosition=true (без quantity)
+    _, sl = http_json(
         "POST", "/fapi/v1/order",
         {
             "symbol": symbol,
@@ -346,83 +347,155 @@ def place_entry_and_brackets(symbol: str, direction: str):
         signed=True
     )
     sl_oid = str(sl.get("orderId", ""))
+
+    print("[LIVE] TP placed:", tp.get("status"), "orderId=", tp_oid)
     print("[LIVE] SL placed:", sl.get("status"), "orderId=", sl_oid)
 
-    # watch & finalize
-    print(f"[WATCH] {symbol}: waiting position close...")
+    # WAIT: Variant A — ждать до тех пор, пока позиция станет 0
+    print(f"[WATCH] {symbol}: waiting TP/SL close (Variant A, no timeout)...")
     t0 = time.time()
-    close_oid = ""
 
     while True:
         amt = position_amt(symbol)
         if amt == 0:
             break
-
-        if WATCH_HARD_TIMEOUT_SEC > 0 and (time.time() - t0) >= WATCH_HARD_TIMEOUT_SEC:
-            print(f"[WATCH] {symbol}: HARD TIMEOUT -> flatten position now")
-            try:
-                close_oid = str(flatten_position(symbol) or "")
-            except Exception as e:
-                print(f"[WATCH] {symbol}: flatten failed: {e}")
-            break
-
         time.sleep(POLL_SEC)
-
-    # cleanup leftover
-    oo = open_orders(symbol)
-    if oo:
-        print(f"[WATCH] {symbol}: position closed -> cancel leftover {len(oo)} orders")
-        cancel_all_open_orders(symbol)
 
     exit_ts = utc_now_iso()
     exit_ms = int(time.time() * 1000)
+    duration_sec = int(max(0, exit_ms - entry_ms) / 1000)
 
-    # determine outcome and exit_price
-    outcome = "UNKNOWN"
-    exit_price = Decimal("0")
-
+    # Determine outcome: TP or SL must be FILLED
     tp_od = get_order(symbol, tp_oid) if tp_oid else {}
     sl_od = get_order(symbol, sl_oid) if sl_oid else {}
 
+    outcome = "UNKNOWN"
+    exit_is_maker = False
+    exit_price = Decimal("0")
+    commission_asset = ""
+    commission = Decimal("0")
+
+    # Комиссия за вход (по userTrades если получится) — иначе оценка
+    entry_fill_price_ut, entry_comm_ut, entry_comm_asset = avg_price_and_commission_from_trades(
+        symbol, entry_oid, entry_ms, exit_ms
+    )
+    # entry_avg уже есть; entry_fill_price_ut используем только для комиссии
+    entry_comm = entry_comm_ut
+    if entry_comm_asset:
+        commission_asset = entry_comm_asset
+
     if tp_od.get("status") == "FILLED":
         outcome = "TP"
-        ep = tp_od.get("avgPrice") or tp_od.get("price")
-        exit_price = Decimal(str(ep or "0"))
-        assumed_exit_is_maker = True
+        exit_is_maker = True  # лимитка чаще maker, но зависит от исполнения
+        # пробуем userTrades точный avg
+        ex_avg_ut, ex_comm_ut, ex_comm_asset = avg_price_and_commission_from_trades(symbol, tp_oid, entry_ms, exit_ms)
+        if ex_avg_ut is not None:
+            exit_price = ex_avg_ut
+        else:
+            ep = tp_od.get("avgPrice") or tp_od.get("price")
+            exit_price = Decimal(str(ep or "0"))
+        commission += ex_comm_ut
+        if ex_comm_asset:
+            commission_asset = ex_comm_asset or commission_asset
+
     elif sl_od.get("status") == "FILLED":
         outcome = "SL"
-        ep = sl_od.get("avgPrice") or sl_od.get("price")
-        exit_price = Decimal(str(ep or "0"))
-        assumed_exit_is_maker = False
-    elif close_oid:
-        outcome = "FORCED_FLATTEN"
-        cl = get_order(symbol, close_oid)
-        ep = cl.get("avgPrice") or cl.get("price")
-        exit_price = Decimal(str(ep or "0"))
-        assumed_exit_is_maker = False
+        exit_is_maker = False
+        ex_avg_ut, ex_comm_ut, ex_comm_asset = avg_price_and_commission_from_trades(symbol, sl_oid, entry_ms, exit_ms)
+        if ex_avg_ut is not None:
+            exit_price = ex_avg_ut
+        else:
+            ep = sl_od.get("avgPrice") or sl_od.get("price")
+            exit_price = Decimal(str(ep or "0"))
+        commission += ex_comm_ut
+        if ex_comm_asset:
+            commission_asset = ex_comm_asset or commission_asset
+
     else:
-        # на всякий случай: если позиция закрылась, но ордера не дают FILLED (особенности API)
-        # пробуем взять last price как приближение
+        # Позиция закрылась, но TP/SL не FILLED => это нарушение инварианта Variant A.
+        note = f"Position closed but TP/SL not FILLED. tp={tp_od.get('status')} sl={sl_od.get('status')}"
+        print(f"[ALERT] {symbol}: {note}")
+
+        # Чистим хвостовые ордера (если остались)
+        try:
+            oo = open_orders(symbol)
+            if oo:
+                cancel_all_open_orders(symbol)
+        except Exception:
+            pass
+
+        # Логируем как ошибку с приблизительной ценой last (только чтобы запись была)
         _, p2 = http_json("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
         exit_price = Decimal(str(p2.get("price") or "0"))
-        assumed_exit_is_maker = False
+        outcome = "UNEXPECTED_CLOSE"
 
-    # gross pnl
-    if direction == "LONG":
-        gross = (exit_price - avg) * qty
-    else:
-        gross = (avg - exit_price) * qty
+        # комиссия (если userTrades есть — попробуем суммарно за окно; иначе fallback)
+        try:
+            # суммируем все комиссии по userTrades в окне
+            trades = get_user_trades(symbol, max(entry_ms - 10_000, 0), exit_ms + 10_000)
+            comm_sum = Decimal("0")
+            for t in trades:
+                c = t.get("commission")
+                if c is None:
+                    continue
+                comm_sum += Decimal(str(c))
+                commission_asset = t.get("commissionAsset", commission_asset) or commission_asset
+            commission = comm_sum
+        except Exception:
+            notional = qty * entry_avg
+            commission = estimate_commission_fallback(notional, exit_is_maker=False)
+            commission_asset = "USDT_EST"
 
-    # commission
-    commission = compute_commission(
-        symbol, entry_oid, tp_oid, sl_oid, close_oid,
-        entry_ms, exit_ms,
-        assumed_exit_is_maker=assumed_exit_is_maker,
-        qty=qty, entry_price=avg
-    )
+        gross = (exit_price - entry_avg) * qty if direction == "LONG" else (entry_avg - exit_price) * qty
+        net = gross - commission
+
+        log_live_trade({
+            "entry_ts": entry_ts,
+            "exit_ts": exit_ts,
+            "symbol": symbol,
+            "side": direction,
+            "qty": qty,
+            "entry_price": entry_avg,
+            "exit_price": exit_price,
+            "gross_pnl": gross,
+            "commission": commission,
+            "commission_asset": commission_asset,
+            "net_pnl": net,
+            "outcome": outcome,
+            "entry_order_id": entry_oid,
+            "tp_order_id": tp_oid,
+            "sl_order_id": sl_oid,
+            "duration_sec": duration_sec,
+            "note": note,
+        })
+
+        print(f"[WATCH] {symbol}: LOGGED -> {LIVE_LOG_PATH} outcome={outcome} netPnL={net}")
+
+        if STOP_ON_UNEXPECTED_CLOSE:
+            raise RuntimeError(f"Variant A violated: {note}")
+        # иначе просто выходим (но это уже мягче, чем Variant A по духу)
+        return
+
+    # Cleanup leftover orders
+    try:
+        oo = open_orders(symbol)
+        if oo:
+            print(f"[WATCH] {symbol}: position closed -> cancel leftover {len(oo)} orders")
+            cancel_all_open_orders(symbol)
+    except Exception:
+        pass
+
+    # Commission: если userTrades по выходу не дали комиссию (0), то fallback
+    commission += entry_comm
+
+    if commission == 0:
+        notional = qty * entry_avg
+        commission = estimate_commission_fallback(notional, exit_is_maker=exit_is_maker)
+        commission_asset = "USDT_EST"
+
+    # Gross/Net PnL
+    gross = (exit_price - entry_avg) * qty if direction == "LONG" else (entry_avg - exit_price) * qty
     net = gross - commission
-
-    duration_sec = int(max(0, exit_ms - entry_ms) / 1000)
 
     log_live_trade({
         "entry_ts": entry_ts,
@@ -430,16 +503,16 @@ def place_entry_and_brackets(symbol: str, direction: str):
         "symbol": symbol,
         "side": direction,
         "qty": qty,
-        "entry_price": avg,
+        "entry_price": entry_avg,
         "exit_price": exit_price,
         "gross_pnl": gross,
         "commission": commission,
+        "commission_asset": commission_asset,
         "net_pnl": net,
         "outcome": outcome,
         "entry_order_id": entry_oid,
         "tp_order_id": tp_oid,
         "sl_order_id": sl_oid,
-        "close_order_id": close_oid,
         "duration_sec": duration_sec,
         "note": "",
     })
@@ -448,35 +521,90 @@ def place_entry_and_brackets(symbol: str, direction: str):
     print(f"[WATCH] {symbol}: DONE. Cooldown {COOLDOWN_SEC}s")
     time.sleep(COOLDOWN_SEC)
 
+# =========================
+# IO Thread: read PAPER stdout continuously
+# =========================
+def stdout_reader(proc, sig_q: queue.Queue, stop_event: threading.Event):
+    try:
+        for raw in proc.stdout:
+            if stop_event.is_set():
+                break
+            line = raw.rstrip("\n")
+            print(line)
+
+            m = OPEN_RE.search(line)
+            if m:
+                symbol = m.group(1).upper()
+                direction = m.group(2).upper()
+
+                # В очередь — но ограничиваем размер
+                if sig_q.qsize() >= MAX_SIGNAL_QUEUE:
+                    print(f"[MIRROR] SIGNAL QUEUE FULL ({MAX_SIGNAL_QUEUE}), drop: {symbol} {direction}")
+                    continue
+
+                sig_q.put((time.time(), symbol, direction))
+    except Exception as e:
+        print("[MIRROR] stdout_reader error:", e)
+
+# =========================
+# Main loop: sequential processing (Variant A)
+# =========================
 def main():
-    print("[MIRROR] Starting PAPER -> LIVE mirror")
+    print("[MIRROR] Starting PAPER -> LIVE mirror (Variant A)")
     print("[MIRROR] Flags: LIVE_ENABLED=", LIVE_ENABLED, "MIRROR_ENABLED=", MIRROR_ENABLED)
     print("[MIRROR] Live: notional_usd=", LIVE_NOTIONAL_USD, "lev=", LIVE_LEVERAGE, "TP%=", TP_PCT*100, "SL%=", SL_PCT*100)
     print("[MIRROR] Live log:", LIVE_LOG_PATH)
     if SKIP_SYMBOLS:
         print("[MIRROR] SKIP_SYMBOLS:", ",".join(sorted(SKIP_SYMBOLS)))
 
+    # Start paper bot
     cmd = [sys.executable, "-u", "run_paper.py"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
-    try:
-        for line in p.stdout:
-            line = line.rstrip("\n")
-            print(line)
+    sig_q = queue.Queue()
+    stop_event = threading.Event()
 
-            # Если уже заняты (MAX_POSITIONS=1) — даже не пытаемся парсить OPEN
-            if count_open_positions() >= MAX_OPEN_POSITIONS:
+    t = threading.Thread(target=stdout_reader, args=(p, sig_q, stop_event), daemon=True)
+    t.start()
+
+    try:
+        # Sequential worker loop
+        while True:
+            # Если процесс paper умер — выходим
+            if p.poll() is not None:
+                raise RuntimeError(f"run_paper.py stopped with code {p.returncode}")
+
+            # Если уже есть открытая позиция (вдруг руками) — Variant A ждёт, ничего не открывает
+            if count_open_positions() >= 1:
+                time.sleep(1.0)
                 continue
 
-            m = OPEN_RE.search(line)
-            if m:
-                symbol = m.group(1).upper()
-                direction = m.group(2).upper()
-                try:
-                    place_entry_and_brackets(symbol, direction)
-                except Exception as e:
-                    print("[MIRROR] ERROR while mirroring:", e)
+            # Ждём сигнал
+            try:
+                _, symbol, direction = sig_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            # Перед исполнением ещё раз проверка: Variant A
+            if count_open_positions() >= 1:
+                # не должны сюда попадать, но ок
+                continue
+
+            if symbol in SKIP_SYMBOLS:
+                print(f"[SAFE] SKIP_SYMBOLS: {symbol}. Пропуск.")
+                continue
+
+            try:
+                place_entry_and_wait_tp_sl(symbol, direction)
+            except Exception as e:
+                print("[MIRROR] ERROR:", e)
+                if STOP_ON_UNEXPECTED_CLOSE:
+                    raise
+
+    except KeyboardInterrupt:
+        print("\n[MIRROR] Stop requested (Ctrl+C).")
     finally:
+        stop_event.set()
         try:
             p.terminate()
         except Exception:
