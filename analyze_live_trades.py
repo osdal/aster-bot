@@ -8,6 +8,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 load_dotenv()
 
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -22,14 +23,15 @@ def dec(x) -> Decimal:
     except (InvalidOperation, ValueError):
         return Decimal("0")
 
+
 def parse_iso(ts: str):
     """
-    Expected format: 2026-01-23T10:55:00Z (or iso with Z).
+    Expected format: 2026-01-23T10:55:00Z (or ISO with timezone).
     Returns aware datetime UTC or None.
     """
     if not ts:
         return None
-    ts = ts.strip()
+    ts = str(ts).strip()
     try:
         if ts.endswith("Z"):
             ts = ts[:-1] + "+00:00"
@@ -40,19 +42,21 @@ def parse_iso(ts: str):
     except Exception:
         return None
 
+
 def pct(a: int, b: int) -> str:
     if b <= 0:
         return "0.00%"
     return f"{(a * 100.0 / b):.2f}%"
 
+
 def money(x: Decimal) -> str:
-    # for small values keep more precision
     ax = abs(x)
     if ax < Decimal("0.1"):
         return f"{x:.8f}"
     if ax < Decimal("1"):
         return f"{x:.6f}"
     return f"{x:.4f}"
+
 
 def max_drawdown(equity_curve):
     """
@@ -81,10 +85,10 @@ def max_drawdown(equity_curve):
 
     return (max_dd, peak, trough, dd_start, dd_end)
 
+
 def streaks(outcomes):
     """
-    outcomes: list[str] per trade like "TP", "SL", "UNEXPECTED_CLOSE", ...
-    Returns dict with max win streak, max loss streak (consider TP=win, SL=loss, others=neutral)
+    TP = win, SL = loss, others = neutral (break streak)
     """
     max_win = 0
     max_loss = 0
@@ -98,36 +102,99 @@ def streaks(outcomes):
             cur_loss += 1
             cur_win = 0
         else:
-            # neutral breaks both
             cur_win = 0
             cur_loss = 0
         max_win = max(max_win, cur_win)
         max_loss = max(max_loss, cur_loss)
     return {"max_win_streak": max_win, "max_loss_streak": max_loss}
 
+
 # -------------------------
-# Load CSV
+# Robust CSV load
 # -------------------------
+EXPECTED_COLUMNS = [
+    "entry_ts", "exit_ts", "symbol", "side", "qty",
+    "entry_price", "exit_price",
+    "gross_pnl", "commission", "net_pnl",
+    "outcome",
+    "entry_order_id", "tp_order_id", "sl_order_id", "close_order_id",
+    "duration_sec", "note"
+]
+
+
+def _clean_row_keys_values(row: dict) -> dict:
+    """
+    DictReader can produce:
+      - key None: list of "extra" fields when row has more columns than header
+      - values None
+    We normalize safely and preserve extra data into 'note' (append).
+    """
+    out = {}
+
+    # 1) process normal keys
+    for k, v in row.items():
+        if k is None:
+            continue
+        kk = str(k).strip()
+        if isinstance(v, str):
+            vv = v.strip()
+        elif v is None:
+            vv = ""
+        else:
+            vv = str(v)
+        out[kk] = vv
+
+    # 2) fold extras (if any) into note
+    extras = row.get(None)
+    if extras:
+        # extras is typically a list of strings
+        extra_text = ",".join([e for e in extras if e is not None])
+        if extra_text.strip():
+            prev = out.get("note", "")
+            if prev:
+                out["note"] = prev + " | EXTRA_CSV=" + extra_text
+            else:
+                out["note"] = "EXTRA_CSV=" + extra_text
+
+    # 3) Ensure all expected columns exist (avoid KeyError later)
+    for col in EXPECTED_COLUMNS:
+        out.setdefault(col, "")
+
+    return out
+
+
 def load_trades(path: str):
     trades = []
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            # Normalize keys just in case
-            r = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+
+        # If header is missing or malformed, fail early with clear message
+        if not reader.fieldnames:
+            raise RuntimeError("CSV header not found or empty. Проверьте первую строку файла.")
+
+        for raw in reader:
+            r = _clean_row_keys_values(raw)
 
             entry_ts = r.get("entry_ts", "")
             exit_ts = r.get("exit_ts", "")
             symbol = r.get("symbol", "")
             side = r.get("side", r.get("direction", ""))
+
             qty = dec(r.get("qty"))
             entry_price = dec(r.get("entry_price"))
             exit_price = dec(r.get("exit_price"))
+
             gross = dec(r.get("gross_pnl"))
             commission = dec(r.get("commission"))
             net = dec(r.get("net_pnl"))
-            outcome = r.get("outcome", "") or ""
-            duration_sec = int(float(r.get("duration_sec") or 0))
+
+            outcome = (r.get("outcome", "") or "").strip()
+
+            # duration_sec may be "", "12", "12.0"
+            try:
+                duration_sec = int(float(r.get("duration_sec") or 0))
+            except Exception:
+                duration_sec = 0
 
             trades.append({
                 "entry_dt": parse_iso(entry_ts),
@@ -144,21 +211,28 @@ def load_trades(path: str):
                 "net": net,
                 "outcome": outcome,
                 "duration_sec": duration_sec,
+                "note": r.get("note", ""),
             })
+
     return trades
 
+
 # -------------------------
-# Report
+# Analysis
 # -------------------------
 def analyze(trades):
-    # Sort by exit time when possible
-    trades_sorted = sorted(trades, key=lambda t: (t["exit_dt"] is None, t["exit_dt"] or datetime(1970, 1, 1, tzinfo=timezone.utc)))
+    trades_sorted = sorted(
+        trades,
+        key=lambda t: (
+            t["exit_dt"] is None,
+            t["exit_dt"] or datetime(1970, 1, 1, tzinfo=timezone.utc)
+        )
+    )
 
     total = len(trades_sorted)
     if total == 0:
         return {"total": 0}
 
-    # Overall PnL stats
     net_list = [t["net"] for t in trades_sorted]
     gross_list = [t["gross"] for t in trades_sorted]
     comm_list = [t["commission"] for t in trades_sorted]
@@ -175,12 +249,10 @@ def analyze(trades):
     avg_net = (total_net / Decimal(total)) if total else Decimal("0")
     median_net = sorted(net_list)[total // 2] if total else Decimal("0")
 
-    # Profit factor
     sum_pos = sum((x for x in net_list if x > 0), Decimal("0"))
     sum_neg = sum((-x for x in net_list if x < 0), Decimal("0"))
     profit_factor = (sum_pos / sum_neg) if sum_neg > 0 else (Decimal("999999") if sum_pos > 0 else Decimal("0"))
 
-    # Equity curve + max drawdown
     equity = []
     cum = Decimal("0")
     for t in trades_sorted:
@@ -188,19 +260,15 @@ def analyze(trades):
         equity.append(cum)
     max_dd, peak, trough, dd_start, dd_end = max_drawdown(equity)
 
-    # Outcome distribution
     outcome_counts = defaultdict(int)
     for o in outcomes:
         outcome_counts[o or ""] += 1
 
-    # Average duration
     durations = [t["duration_sec"] for t in trades_sorted if t["duration_sec"] is not None]
     avg_dur = (sum(durations) / len(durations)) if durations else 0
 
-    # Streaks based on TP/SL only
     st = streaks(outcomes)
 
-    # Per symbol stats
     by_sym = defaultdict(list)
     for t in trades_sorted:
         by_sym[t["symbol"]].append(t)
@@ -212,6 +280,7 @@ def analyze(trades):
         w = sum(1 for x in arr if x["net"] > 0)
         l = sum(1 for x in arr if x["net"] < 0)
         be = n - w - l
+
         sum_pos_s = sum((x["net"] for x in arr if x["net"] > 0), Decimal("0"))
         sum_neg_s = sum((-x["net"] for x in arr if x["net"] < 0), Decimal("0"))
         pf_s = (sum_pos_s / sum_neg_s) if sum_neg_s > 0 else (Decimal("999999") if sum_pos_s > 0 else Decimal("0"))
@@ -234,10 +303,8 @@ def analyze(trades):
             "other": other
         })
 
-    # Sort per symbol by net descending
     per_symbol.sort(key=lambda x: x["net"], reverse=True)
 
-    # Day breakdown (UTC by default)
     by_day = defaultdict(list)
     for t in trades_sorted:
         dt = t["exit_dt"] or t["entry_dt"]
@@ -251,9 +318,11 @@ def analyze(trades):
         s = sum(vals, Decimal("0"))
         day_rows.append((day, s, len(vals)))
 
-    # Identify "bad events" for Variant A
-    unexpected = sum(1 for t in trades_sorted if t["outcome"] in ("UNEXPECTED_CLOSE", "FORCED_FLATTEN", "WATCH_TIMEOUT", ""))
-    # WATCH_TIMEOUT should not exist in Variant A; FORCED_FLATTEN too.
+    # Variant A expects only TP/SL, no timeouts/forced/empty
+    unexpected = sum(
+        1 for t in trades_sorted
+        if (t["outcome"] not in ("TP", "SL"))
+    )
 
     return {
         "total": total,
@@ -279,6 +348,7 @@ def analyze(trades):
         "first_ts": trades_sorted[0]["exit_ts"] or trades_sorted[0]["entry_ts"],
         "last_ts": trades_sorted[-1]["exit_ts"] or trades_sorted[-1]["entry_ts"],
     }
+
 
 def print_report(stats):
     if stats.get("total", 0) == 0:
@@ -309,7 +379,6 @@ def print_report(stats):
     print(f"Max streaks:    win={stats['streaks']['max_win_streak']}  loss={stats['streaks']['max_loss_streak']}")
     print("-" * 72)
 
-    # Outcomes
     print("Outcomes:")
     oc = stats["outcome_counts"]
     for k in sorted(oc.keys(), key=lambda x: (x == "", x)):
@@ -318,10 +387,10 @@ def print_report(stats):
 
     if stats["unexpected"] > 0:
         print("-" * 72)
-        print(f"WARNING: Unexpected/Non-Variant-A outcomes: {stats['unexpected']}")
-        print("Variant A expects only TP/SL (no WATCH_TIMEOUT/FORCED_FLATTEN/empty outcomes).")
+        print(f"WARNING: Non-Variant-A outcomes count: {stats['unexpected']}")
+        print("Variant A expects only TP/SL outcomes in live_trades.csv.")
+        print("Если это число > 0 — значит либо лог писался не из Variant A, либо есть нестандартные закрытия.")
 
-    # Per symbol table (top 10)
     print("-" * 72)
     print("Per-symbol (sorted by Net PnL):")
     print(f"{'SYMBOL':10s} {'TR':>3s} {'NET':>14s} {'WIN%':>7s} {'PF':>8s} {'TP':>4s} {'SL':>4s} {'OTH':>4s}")
@@ -331,7 +400,6 @@ def print_report(stats):
         print(f"{row['symbol']:10s} {row['trades']:3d} {money(row['net']):>14s} "
               f"{row['winrate']:6.2f}% {pf_str:>8s} {row['tp']:4d} {row['sl']:4d} {row['other']:4d}")
 
-    # By day
     if stats["day_rows"]:
         print("-" * 72)
         print("By day (UTC):")
@@ -341,11 +409,8 @@ def print_report(stats):
 
     print("=" * 72)
 
+
 def main():
-    # Path resolution priority:
-    # 1) CLI arg
-    # 2) LIVE_LOG_PATH from env
-    # 3) default data\live_trades.csv
     if len(sys.argv) >= 2:
         path = sys.argv[1]
     else:
@@ -360,6 +425,7 @@ def main():
     trades = load_trades(path)
     stats = analyze(trades)
     print_report(stats)
+
 
 if __name__ == "__main__":
     main()
