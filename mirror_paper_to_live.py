@@ -1,4 +1,4 @@
-import os, sys, time, re, hmac, hashlib, urllib.parse, urllib.request, json, subprocess, csv, queue, threading
+﻿import os, sys, time, re, hmac, hashlib, urllib.parse, urllib.request, json, subprocess, csv, queue, threading
 from decimal import Decimal, ROUND_DOWN
 from urllib.error import HTTPError
 from datetime import datetime, timezone
@@ -282,7 +282,7 @@ def flatten_position(symbol: str) -> str:
 # =========================================================
 # LIVE TRADE EXECUTION (blocks until position is closed)
 # =========================================================
-def place_entry_and_brackets(symbol: str, direction: str) -> dict:
+def place_entry_and_brackets(symbol: str, direction: str, cooldown_sec: int | None = None) -> dict:
     """
     Returns dict with at least:
       net_pnl (Decimal), outcome (str), symbol (str)
@@ -501,8 +501,11 @@ def place_entry_and_brackets(symbol: str, direction: str) -> dict:
     })
 
     print(f"[WATCH] {symbol}: LOGGED -> {LIVE_LOG_PATH} outcome={outcome} netPnL={net}")
-    print(f"[WATCH] {symbol}: DONE. Cooldown {COOLDOWN_SEC}s")
-    time.sleep(COOLDOWN_SEC)
+    if cooldown_sec and cooldown_sec > 0:
+        print(f"[WATCH] {symbol}: DONE. Cooldown {cooldown_sec}s")
+        time.sleep(cooldown_sec)
+    else:
+        print(f"[WATCH] {symbol}: DONE. Cooldown disabled")
 
     return {"symbol": symbol, "outcome": outcome, "net_pnl": net}
 
@@ -544,6 +547,11 @@ def arm_symbol(symbol: str):
     global active_symbol
     if symbol in SKIP_SYMBOLS:
         return
+
+    # Cooldown: в режиме 'armed' (Strategy A) мы хотим действовать сразу.
+    # live_worker_thread передает cooldown_sec=0, чтобы не ждать паузу между сигналами.
+    if cooldown_sec is None:
+        cooldown_sec = COOLDOWN_SEC
     with state_lock:
         if symbol == active_symbol:
             return
@@ -634,7 +642,7 @@ def live_worker_thread():
 
         # Execute LIVE trade (blocking until closed/timeout-profit-close)
         try:
-            res = place_entry_and_brackets(sym, direction)
+            res = place_entry_and_brackets(sym, direction, cooldown_sec=0)
         except Exception as e:
             print(f"[LIVE] ERROR while mirroring {sym}: {e}")
             continue
