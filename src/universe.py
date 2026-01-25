@@ -1,185 +1,237 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+from typing import Dict, List, Tuple
 import time
-from typing import Any
 
 from .aster_api import AsterAPI
-from .indicators.atr import atr_pct
 
+# Robust ATR import:
+#  - Some projects have src/indicators.py (module)
+#  - Others have src/indicators/atr.py (package)
+#  - We support both; and have a tiny fallback implementation.
+def _atr_fallback(ohlc: List[Tuple[float,float,float,float]], period: int) -> float:
+    # Wilder ATR
+    if not ohlc or len(ohlc) < period + 1:
+        return 0.0
+    trs = []
+    prev_close = ohlc[0][3]
+    for i in range(1, len(ohlc)):
+        _, h, l, c = ohlc[i]
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    if len(trs) < period:
+        return 0.0
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+try:
+    # src/indicators.py style
+    from .indicators import atr as _atr  # type: ignore
+except Exception:
+    _atr = None
+
+def _atr_value(ohlc: List[Tuple[float,float,float,float]], period: int) -> float:
+    if _atr:
+        try:
+            return float(_atr(ohlc, period))
+        except Exception:
+            pass
+    # try package style
     try:
-        return float(x)
+        from .indicators.atr import atr as _atr2  # type: ignore
+        return float(_atr2(ohlc, period))
     except Exception:
-        return default
+        return _atr_fallback(ohlc, period)
 
 
-def _calc_spread_pct(bid: float, ask: float) -> float | None:
-    if bid <= 0 or ask <= 0 or ask < bid:
-        return None
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return None
-    return (ask - bid) / mid * 100.0
-
-
-def build_universe_once(cfg) -> dict:
+def build_universe_once(cfg) -> Dict:
     """
     Returns:
-      {
-        "ts": int,
-        "activeSymbols": [..],
-        "entries": { SYMBOL: {meta...} }
-      }
+      {"activeSymbols": [...], "meta": {...}}
+
+    Selection logic:
+      1) If ACTIVE_SYMBOLS is set in .env -> use exactly these (after blacklist/quote sanity).
+      2) Otherwise build from exchange data and apply:
+         - QUOTE filter (USDT)
+         - SYMBOL_MODE:
+            WHITELIST_ONLY: only whitelist
+            AUTO_ONLY: ignore whitelist priority
+            HYBRID_PRIORITY: whitelist first, then auto selection
+         - Liquidity/Spread/ATR filters
     """
     api = AsterAPI(cfg.REST_BASE)
 
     quote = getattr(cfg, "QUOTE", "USDT")
-    min_qv = float(getattr(cfg, "MIN_24H_QUOTE_VOL", 0))
-    max_spread = float(getattr(cfg, "MAX_SPREAD_PCT", 999))
-    min_atr = float(getattr(cfg, "MIN_ATR_PCT", 0))
-    mode = str(getattr(cfg, "SYMBOL_MODE", "HYBRID_PRIORITY")).upper()
-
+    mode = (getattr(cfg, "SYMBOL_MODE", "HYBRID_PRIORITY") or "HYBRID_PRIORITY").upper()
     whitelist = set(getattr(cfg, "WHITELIST", []) or [])
     blacklist = set(getattr(cfg, "BLACKLIST", []) or [])
-    forced_active = [s for s in (getattr(cfg, "ACTIVE_SYMBOLS", []) or []) if s]
+    active_override = list(getattr(cfg, "ACTIVE_SYMBOLS", []) or [])
 
-    wl_priority = bool(getattr(cfg, "WHITELIST_PRIORITY", True))
-    wl_bypass_liq = bool(getattr(cfg, "WHITELIST_BYPASS_LIQUIDITY", False))
-
-    target = int(getattr(cfg, "TARGET_SYMBOLS", 20))
-    auto_top_n = int(getattr(cfg, "AUTO_TOP_N", 40))
-
-    tf_sec = int(getattr(cfg, "TF_SEC", 60))
-    lookback_min = int(getattr(cfg, "LOOKBACK_MINUTES", 20))
-    atr_period = int(getattr(cfg, "ATR_PERIOD", 14))
-
-    # Fetch exchangeInfo to validate symbols
-    ex = api.exchange_info()
-    symbols_info = {s.get("symbol"): s for s in ex.get("symbols", []) if isinstance(s, dict)}
-    all_symbols = set(symbols_info.keys())
-
-    # Forced active symbols (great for debugging). If provided, do not apply filters here.
-    if forced_active:
-        forced = []
-        for s in forced_active:
-            s = s.upper()
-            if s in blacklist:
-                continue
-            if s not in all_symbols:
-                continue
-            # keep only correct quote
+    # 1) ACTIVE_SYMBOLS override
+    if active_override:
+        active = []
+        for s in active_override:
+            s = str(s).upper()
             if not s.endswith(quote):
                 continue
-            forced.append(s)
-        entries = {s: {"symbol": s, "enabled_for_entry": True, "note": "FORCED_ACTIVE"} for s in forced}
-        return {"ts": int(time.time()), "activeSymbols": forced[:target], "entries": entries}
+            if s in blacklist:
+                continue
+            active.append(s)
+        # optional: keep unique while preserving order
+        seen = set()
+        active2 = []
+        for s in active:
+            if s not in seen:
+                active2.append(s)
+                seen.add(s)
+        return {"activeSymbols": active2, "meta": {"mode": "ACTIVE_SYMBOLS_OVERRIDE"}}
 
-    # Tickers & book tickers
-    tickers = api.ticker_24h()
-    # Aster API is Binance-like: /fapi/v1/ticker/24hr returns list[dict]
-    if not isinstance(tickers, list):
-        tickers = []
-
-    # spread requires bid/ask; use bookTicker list
-    book = api.book_tickers()
-    book_map = {}
-    if isinstance(book, list):
-        for b in book:
-            sym = (b or {}).get("symbol")
-            if sym:
-                book_map[str(sym).upper()] = b
-
-    # Build candidate list by volume
-    candidates: list[dict] = []
-    for t in tickers:
-        if not isinstance(t, dict):
-            continue
-        sym = (t.get("symbol") or t.get("s") or "").upper()
+    # 2) Automatic selection
+    ex = api.exchange_info()
+    symbols = []
+    for s in ex.get("symbols", []):
+        sym = s.get("symbol")
         if not sym or not sym.endswith(quote):
             continue
         if sym in blacklist:
             continue
+        # only PERPETUAL contracts if available
+        if s.get("contractType") and s.get("contractType") != "PERPETUAL":
+            continue
+        if s.get("status") and s.get("status") != "TRADING":
+            continue
+        symbols.append(sym)
 
-        qv = _safe_float(t.get("quoteVolume") or t.get("quoteVolume24h") or t.get("quoteVol") or 0.0, 0.0)
+    # 24h tickers
+    tickers = api.tickers_24h()
+    tmap = {t.get("symbol"): t for t in tickers if t.get("symbol")}
 
-        # spread from book ticker (preferred)
-        b = book_map.get(sym, {})
-        bid = _safe_float(b.get("bidPrice") or b.get("bid") or 0.0, 0.0)
-        ask = _safe_float(b.get("askPrice") or b.get("ask") or 0.0, 0.0)
-        spread = _calc_spread_pct(bid, ask)
+    min_qv = float(getattr(cfg, "MIN_24H_QUOTE_VOL", 3_000_000))
+    max_spread = float(getattr(cfg, "MAX_SPREAD_PCT", 0.10))
+    min_atr = float(getattr(cfg, "MIN_ATR_PCT", 0.03))
+
+    tf_sec = int(getattr(cfg, "TF_SEC", 60))
+    lookback_minutes = int(getattr(cfg, "LOOKBACK_MINUTES", 20))
+    atr_period = int(getattr(cfg, "ATR_PERIOD", 14))
+
+    klines_limit = max(atr_period + 2, int((lookback_minutes * 60) / max(tf_sec, 1)) + 2)
+
+    candidates = []
+    for sym in symbols:
+        t = tmap.get(sym)
+        if not t:
+            continue
+
+        try:
+            quote_vol = float(t.get("quoteVolume") or 0)
+        except Exception:
+            quote_vol = 0.0
+
+        # spread (bid/ask)
+        try:
+            mp = api.mark_price(sym)
+            bid = float(mp.get("bidPrice") or 0)
+            ask = float(mp.get("askPrice") or 0)
+            mid = (bid + ask) / 2 if (bid and ask) else 0.0
+            spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 999.0
+        except Exception:
+            spread_pct = 999.0
+
+        # OHLC for ATR
+        try:
+            kl = api.klines(sym, interval_sec=tf_sec, limit=klines_limit)
+            ohlc = []
+            for k in kl:
+                # expected [openTime, open, high, low, close, ...] or dicts
+                if isinstance(k, (list, tuple)) and len(k) >= 5:
+                    o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
+                elif isinstance(k, dict):
+                    o = float(k.get("open")); h = float(k.get("high")); l = float(k.get("low")); c = float(k.get("close"))
+                else:
+                    continue
+                ohlc.append((o,h,l,c))
+            last_close = ohlc[-1][3] if ohlc else 0.0
+            atr_val = _atr_value(ohlc, atr_period)
+            atr_pct = (atr_val / last_close * 100.0) if last_close > 0 else 0.0
+        except Exception:
+            atr_pct = 0.0
 
         candidates.append({
             "symbol": sym,
-            "quoteVol": qv,
-            "bid": bid,
-            "ask": ask,
-            "spreadPct": spread,
+            "quote_vol": quote_vol,
+            "spread_pct": spread_pct,
+            "atr_pct": atr_pct,
         })
 
-    candidates.sort(key=lambda x: x["quoteVol"], reverse=True)
-    auto_syms = [x["symbol"] for x in candidates[:auto_top_n]]
-
-    # Merge per mode
-    merged: list[str] = []
-    if mode == "WHITELIST_ONLY":
-        merged = [s for s in sorted(whitelist) if s.endswith(quote) and s not in blacklist]
-    elif mode in ("HYBRID_PRIORITY", "HYBRID"):
-        wl_list = [s for s in sorted(whitelist) if s.endswith(quote) and s not in blacklist]
-        if wl_priority:
-            merged.extend(wl_list)
-            for s in auto_syms:
-                if s not in merged and s not in blacklist:
-                    merged.append(s)
-        else:
-            merged.extend(auto_syms)
-            for s in wl_list:
-                if s not in merged:
-                    merged.append(s)
-    else:
-        # fallback: just auto
-        merged = list(auto_syms)
-
-    merged = merged[:max(1, target)]
-
-    # Compute final entries with filters
-    entries: dict[str, dict] = {}
-    active: list[str] = []
-
-    for sym in merged:
-        sym = sym.upper()
+    # liquidity/spread/atr filters
+    filtered = []
+    for c in candidates:
+        sym = c["symbol"]
         if sym in blacklist:
             continue
-        if sym not in all_symbols:
+
+        # whitelist bypass (optional)
+        if sym in whitelist and bool(getattr(cfg, "WHITELIST_BYPASS_LIQUIDITY", False)):
+            filtered.append(c)
             continue
 
-        # liquidity/spread
-        meta = next((x for x in candidates if x["symbol"] == sym), None) or {"quoteVol": 0.0, "spreadPct": None}
-        qv = float(meta.get("quoteVol", 0.0))
-        spread = meta.get("spreadPct", None)
-
-        # Liquidity filter (can bypass for whitelist)
-        if (qv < min_qv) and not (wl_bypass_liq and sym in whitelist):
-            entries[sym] = {"symbol": sym, "enabled_for_entry": False, "reason": "LOW_LIQUIDITY", "quoteVol": qv, "spreadPct": spread}
+        if c["quote_vol"] < min_qv:
             continue
-
-        # Spread filter (if unknown, do not block — it’s safer than producing activeSymbols=0)
-        if spread is not None and spread > max_spread:
-            entries[sym] = {"symbol": sym, "enabled_for_entry": False, "reason": "HIGH_SPREAD", "quoteVol": qv, "spreadPct": spread}
+        if c["spread_pct"] > max_spread:
             continue
-
-        # ATR filter (needs klines)
-        try:
-            kl = api.klines(sym, interval_sec=tf_sec, limit=max(atr_period + 5, 50), lookback_minutes=lookback_min)
-            ap = atr_pct(kl, period=atr_period)
-        except Exception:
-            ap = 0.0
-
-        if ap < min_atr and not (sym in whitelist and wl_bypass_liq):
-            entries[sym] = {"symbol": sym, "enabled_for_entry": False, "reason": "LOW_ATR", "quoteVol": qv, "spreadPct": spread, "atrPct": ap}
+        if c["atr_pct"] < min_atr:
             continue
+        filtered.append(c)
 
-        entries[sym] = {"symbol": sym, "enabled_for_entry": True, "quoteVol": qv, "spreadPct": spread, "atrPct": ap}
-        active.append(sym)
+    # Ranking
+    filtered.sort(key=lambda x: (x["quote_vol"], -x["spread_pct"], x["atr_pct"]), reverse=True)
 
-    return {"ts": int(time.time()), "activeSymbols": active, "entries": entries}
+    auto_top_n = int(getattr(cfg, "AUTO_TOP_N", 40))
+    target = int(getattr(cfg, "TARGET_SYMBOLS", 20))
+
+    auto = [c["symbol"] for c in filtered[:max(1, auto_top_n)]]
+
+    active: List[str] = []
+    if mode == "WHITELIST_ONLY":
+        active = [s for s in whitelist if s.endswith(quote) and s not in blacklist]
+    elif mode == "AUTO_ONLY":
+        active = auto[:target]
+    else:
+        # HYBRID_PRIORITY
+        wl = [s for s in whitelist if s.endswith(quote) and s not in blacklist]
+        if bool(getattr(cfg, "WHITELIST_PRIORITY", True)):
+            # whitelist first, then auto without duplicates
+            seen = set()
+            for s in wl:
+                if s not in seen:
+                    active.append(s); seen.add(s)
+            for s in auto:
+                if s not in seen:
+                    active.append(s); seen.add(s)
+        else:
+            # auto first, then whitelist
+            seen = set()
+            for s in auto:
+                if s not in seen:
+                    active.append(s); seen.add(s)
+            for s in wl:
+                if s not in seen:
+                    active.append(s); seen.add(s)
+
+        active = active[:target]
+
+    meta = {
+        "mode": mode,
+        "target": target,
+        "quote": quote,
+        "min_quote_vol": min_qv,
+        "max_spread_pct": max_spread,
+        "min_atr_pct": min_atr,
+        "count_candidates": len(candidates),
+        "count_filtered": len(filtered),
+        "ts": int(time.time()),
+    }
+    return {"activeSymbols": active, "meta": meta}
