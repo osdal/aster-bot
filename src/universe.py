@@ -1,4 +1,5 @@
-﻿import time
+﻿import os
+import time
 from typing import Any
 
 from .aster_api import AsterAPI
@@ -26,8 +27,9 @@ def _calc_spread_pct(bid: float, ask: float) -> float | None:
 
 
 def build_universe_once(cfg) -> dict:
-    api = AsterAPI(cfg.REST_BASE)
-    ts = int(time.time())
+    # Backward/forward compatibility: don't crash if cfg.REST_BASE is missing
+    rest_base = getattr(cfg, "REST_BASE", None) or os.getenv("ASTER_REST_BASE", "https://fapi.asterdex.com").rstrip("/")
+    api = AsterAPI(rest_base)
 
     exch = api.exchange_info()
     symbols_raw = exch.get("symbols", [])
@@ -37,171 +39,111 @@ def build_universe_once(cfg) -> dict:
         sym = _normalize_symbol(s.get("symbol", ""))
         if not sym:
             continue
-        if _normalize_symbol(s.get("quoteAsset", "")) != cfg.QUOTE:
+
+        # only USDT perpetuals (common pattern)
+        ct = (s.get("contractType") or "").upper()
+        q = (s.get("quoteAsset") or "").upper()
+        status = (s.get("status") or "").upper()
+        if q != "USDT":
             continue
-        status = _normalize_symbol(s.get("status", ""))
-        if status and status != "TRADING":
+        if ct and ct not in {"PERPETUAL"}:
             continue
-        symbols_info[sym] = {
-            "status": status,
-            "baseAsset": s.get("baseAsset"),
-            "quoteAsset": s.get("quoteAsset"),
-        }
-
-    t24_list = api.ticker_24h()
-    t24: dict[str, dict] = {}
-    for row in t24_list:
-        sym = _normalize_symbol(row.get("symbol", ""))
-        if sym in symbols_info:
-            t24[sym] = {
-                "quoteVolume": _safe_float(row.get("quoteVolume")),
-                "lastPrice": _safe_float(row.get("lastPrice")),
-            }
-
-    # Auto candidates by quote volume
-    auto_candidates = []
-    for sym, row in t24.items():
-        if sym in cfg.BLACKLIST:
+        if status and status not in {"TRADING"}:
             continue
-        qv = row.get("quoteVolume") or 0.0
-        if qv >= cfg.MIN_24H_QUOTE_VOL:
-            auto_candidates.append((sym, qv))
-    auto_candidates.sort(key=lambda x: x[1], reverse=True)
-    auto_syms = [sym for sym, _ in auto_candidates[: cfg.AUTO_TOP_N]]
 
-    wl = {s for s in cfg.WHITELIST if s in symbols_info and s not in cfg.BLACKLIST}
-    auto_set = {s for s in auto_syms if s in symbols_info and s not in cfg.BLACKLIST}
+        symbols_info[sym] = s
 
-    mode = cfg.SYMBOL_MODE
-    merged: list[tuple[str, str]] = []
+    tickers = api.ticker_24h()
+    if not isinstance(tickers, list):
+        tickers = []
 
-    if mode == "WHITELIST_ONLY":
-        merged = [(s, "WHITELIST") for s in sorted(wl)]
-    elif mode == "AUTO_ONLY":
-        merged = [(s, "AUTO") for s in auto_syms if s in auto_set]
-    elif mode == "HYBRID_UNION":
-        union = list(wl.union(auto_set))
+    # build candidates with filters
+    min_atr = float(getattr(cfg, "MIN_ATR_PCT", 0.0))
+    max_spread = float(getattr(cfg, "MAX_SPREAD_PCT", 9999.0))
+    min_qv = float(getattr(cfg, "MIN_24H_QUOTE_VOL", 0.0))
 
-        def score(sym: str) -> float:
-            qv = (t24.get(sym, {}) or {}).get("quoteVolume") or 0.0
-            return (1e18 if sym in wl else 0.0) + qv
+    items = []
+    for t in tickers:
+        sym = _normalize_symbol(t.get("symbol", ""))
+        if sym not in symbols_info:
+            continue
 
-        union.sort(key=score, reverse=True)
-        union = union[: cfg.TARGET_SYMBOLS]
-        merged = [(s, "WHITELIST" if s in wl else "AUTO") for s in union]
-    else:
-        # HYBRID_PRIORITY
-        out = []
-        if cfg.WHITELIST_PRIORITY:
-            out.extend([(s, "WHITELIST") for s in sorted(wl)])
-        for s in auto_syms:
-            if s in auto_set and s not in wl:
-                out.append((s, "AUTO"))
-            if len(out) >= cfg.TARGET_SYMBOLS:
-                break
-        merged = out[: cfg.TARGET_SYMBOLS]
+        qv = _safe_float(t.get("quoteVolume")) or 0.0
+        if qv < min_qv:
+            continue
 
-    # Spread data
-    book_list = api.book_ticker()
-    book: dict[str, dict] = {}
-    for row in book_list:
-        sym = _normalize_symbol(row.get("symbol", ""))
-        if sym:
-            bid = _safe_float(row.get("bidPrice"))
-            ask = _safe_float(row.get("askPrice"))
-            if bid is not None and ask is not None:
-                book[sym] = {"bid": bid, "ask": ask}
+        bid = _safe_float(t.get("bidPrice")) or 0.0
+        ask = _safe_float(t.get("askPrice")) or 0.0
+        spread = _calc_spread_pct(bid, ask)
+        if spread is None or spread > max_spread:
+            continue
 
-    entries = {}
-    for sym, source in merged:
-        qv = (t24.get(sym, {}) or {}).get("quoteVolume")
-        last_price = (t24.get(sym, {}) or {}).get("lastPrice")
-
-        entry = {
-            "symbol": sym,
-            "source": source,
-            "enabled": True,
-            "enabled_for_entry": True,
-            "reason_disabled": [],
-            "quoteVolume24h": qv,
-            "spreadPct": None,
-            "atrPct": None,
-            "lastUpdateTs": ts,
-        }
-
-        # Liquidity
-        if source == "AUTO":
-            if (qv or 0.0) < cfg.MIN_24H_QUOTE_VOL:
-                entry["enabled_for_entry"] = False
-                entry["reason_disabled"].append("LOW_LIQUIDITY")
-        else:
-            if not cfg.WHITELIST_BYPASS_LIQUIDITY and (qv or 0.0) < cfg.MIN_24H_QUOTE_VOL:
-                entry["enabled_for_entry"] = False
-                entry["reason_disabled"].append("LOW_LIQUIDITY")
-
-        # Spread
-        if sym in book:
-            sp = _calc_spread_pct(book[sym]["bid"], book[sym]["ask"])
-            entry["spreadPct"] = sp
-            if sp is not None and sp > cfg.MAX_SPREAD_PCT:
-                entry["enabled_for_entry"] = False
-                entry["reason_disabled"].append("SPREAD_TOO_HIGH")
-
-        # ATR%
+        # ATR on recent klines
         try:
-            limit = max(50, cfg.ATR_PERIOD + 20)
-            k = api.klines(sym, interval="1m", limit=limit)
-            ohlc = []
-            for row in k:
-                o = _safe_float(row[1]); h = _safe_float(row[2]); l = _safe_float(row[3]); c = _safe_float(row[4])
-                if None not in (o, h, l, c):
-                    ohlc.append((o, h, l, c))
-            a = atr(ohlc, cfg.ATR_PERIOD)
-            if a is not None and last_price and last_price > 0:
-                atr_pct = a / last_price * 100.0
-                entry["atrPct"] = atr_pct
-                if atr_pct < cfg.MIN_ATR_PCT:
-                    entry["enabled_for_entry"] = False
-                    entry["reason_disabled"].append("ATR_TOO_LOW")
+            kl = api.klines(sym, interval="1m", limit=100)
+            atr_pct = atr.atr_pct_from_klines(kl)  # returns percent
         except Exception:
-            entry["enabled_for_entry"] = False
-            entry["reason_disabled"].append("KLINES_ERROR")
+            continue
 
-        entries[sym] = entry
+        if atr_pct < min_atr:
+            continue
 
-    active = [s for s, e in entries.items() if e["enabled_for_entry"]]
+        items.append({
+            "symbol": sym,
+            "quoteVolume": qv,
+            "spreadPct": spread,
+            "atrPct": atr_pct,
+        })
 
-    return {
-        "mode": cfg.SYMBOL_MODE,
-        "symbols": entries,
-        "activeSymbols": active,
-        "updatedAt": ts,
-    }
+    mode = str(getattr(cfg, "SYMBOL_MODE", "HYBRID_PRIORITY")).upper()
+    target = int(getattr(cfg, "TARGET_SYMBOLS", 15))
 
+    if mode == "LIST":
+        raw = str(getattr(cfg, "SYMBOLS_LIST", "")).strip()
+        wanted = [_normalize_symbol(x) for x in raw.split(",") if x.strip()]
+        active = [s for s in wanted if s in symbols_info]
+        return {"activeSymbols": active[:target], "mode": mode, "candidates": items}
 
-def print_universe_summary(universe: dict) -> None:
-    print(f"\nUniverse mode: {universe['mode']}")
-    print(f"Total symbols: {len(universe['symbols'])}")
-    print(f"Active for entry: {len(universe['activeSymbols'])}\n")
+    # Sorting helpers
+    by_vol = sorted(items, key=lambda x: x["quoteVolume"], reverse=True)
+    by_atr = sorted(items, key=lambda x: x["atrPct"], reverse=True)
+    by_spread = sorted(items, key=lambda x: x["spreadPct"])
 
-    for sym, e in universe["symbols"].items():
-        qv = e["quoteVolume24h"]
-        sp = e["spreadPct"]
-        ap = e["atrPct"]
-        flags = "" if e["enabled_for_entry"] else ("DISABLED: " + ",".join(e["reason_disabled"]))
-        print(
-            f"{sym:12} src={e['source']:<9} "
-            f"qVol={qv if qv is not None else 'NA':>10} "
-            f"spread%={sp if sp is not None else 'NA':>6} "
-            f"atr%={ap if ap is not None else 'NA':>6} "
-            f"{flags}"
-        )
+    active: list[str] = []
 
+    if mode == "TOP_VOLUME":
+        active = [x["symbol"] for x in by_vol[:target]]
+    elif mode == "TOP_ATR":
+        active = [x["symbol"] for x in by_atr[:target]]
+    elif mode == "LOW_SPREAD":
+        active = [x["symbol"] for x in by_spread[:target]]
+    else:
+        # HYBRID / HYBRID_PRIORITY:
+        # take a mix: 50% volume, 30% atr, 20% low spread (dedup, keep order)
+        n1 = max(1, int(target * 0.5))
+        n2 = max(1, int(target * 0.3))
+        n3 = max(1, target - n1 - n2)
 
-def save_universe_json(universe: dict, path: str) -> None:
-    import json
-    import os
+        seq = []
+        if mode == "HYBRID_PRIORITY":
+            seq = (
+                [x["symbol"] for x in by_vol[:n1]] +
+                [x["symbol"] for x in by_atr[:n2]] +
+                [x["symbol"] for x in by_spread[:n3]]
+            )
+        else:
+            # plain hybrid: interleave
+            seq = []
+            seq.extend([x["symbol"] for x in by_vol[:n1]])
+            seq.extend([x["symbol"] for x in by_atr[:n2]])
+            seq.extend([x["symbol"] for x in by_spread[:n3]])
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(universe, f, ensure_ascii=False, indent=2)
+        seen = set()
+        for s in seq:
+            if s not in seen:
+                seen.add(s)
+                active.append(s)
+            if len(active) >= target:
+                break
+
+    return {"activeSymbols": active, "mode": mode, "candidates": items}
