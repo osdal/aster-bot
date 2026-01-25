@@ -2,123 +2,130 @@ import os
 from dataclasses import dataclass
 from typing import List
 
-def _b(v: str, default: bool=False) -> bool:
+
+def _to_bool(v: str, default: bool = False) -> bool:
     if v is None:
         return default
-    return v.strip().lower() in ("1","true","yes","y","on")
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
-def _i(v: str, default: int) -> int:
+
+def _to_int(v: str, default: int) -> int:
+    if v is None:
+        return default
+    s = str(v).strip()
     try:
-        return int(str(v).strip())
+        return int(s)
+    except Exception:
+        # tolerate accidental extra chars (e.g., "20А")
+        digits = "".join(ch for ch in s if ch.isdigit() or ch == "-")
+        return int(digits) if digits not in ("", "-") else default
+
+
+def _to_float(v: str, default: float) -> float:
+    if v is None:
+        return default
+    s = str(v).strip().replace(",", ".")
+    try:
+        return float(s)
     except Exception:
         return default
 
-def _f(v: str, default: float) -> float:
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return default
 
-def _csv(v: str) -> List[str]:
+def _csv_list(v: str) -> List[str]:
     if not v:
         return []
-    return [s.strip().upper() for s in v.split(",") if s.strip()]
+    return [x.strip().upper() for x in str(v).split(",") if x.strip()]
+
 
 @dataclass
 class Config:
     # endpoints
     REST_BASE: str
     WS_BASE: str
-    QUOTE: str = "USDT"
 
-    # universe / symbols
-    SYMBOL_MODE: str = "HYBRID_PRIORITY"  # WHITELIST_ONLY | HYBRID_PRIORITY | AUTO_ONLY
-    ACTIVE_SYMBOLS: List[str] = None      # if set -> bypass filters and use exactly these
-    WHITELIST: List[str] = None
-    BLACKLIST: List[str] = None
-    LIVE_ALLOW_SYMBOLS: List[str] = None
+    # universe selection
+    SYMBOL_MODE: str              # HYBRID_PRIORITY | WHITELIST_ONLY | AUTO_ONLY
+    QUOTE: str                    # USDT
+    ACTIVE_SYMBOLS: List[str]     # hard override for paper symbols (if set)
+    TARGET_SYMBOLS: int
+    AUTO_TOP_N: int
+    REFRESH_UNIVERSE_SEC: int
 
-    AUTO_TOP_N: int = 40
-    TARGET_SYMBOLS: int = 20
-    REFRESH_UNIVERSE_SEC: int = 900
+    WHITELIST: List[str]
+    BLACKLIST: List[str]
+    WHITELIST_PRIORITY: bool
+    WHITELIST_BYPASS_LIQUIDITY: bool
 
-    MIN_24H_QUOTE_VOL: float = 3_000_000.0
-    MAX_SPREAD_PCT: float = 0.10
-    MIN_ATR_PCT: float = 0.03
+    MIN_24H_QUOTE_VOL: float
+    MAX_SPREAD_PCT: float
+    MIN_ATR_PCT: float
+    TF_SEC: int
+    LOOKBACK_MINUTES: int
+    ATR_PERIOD: int
 
-    TF_SEC: int = 60
-    LOOKBACK_MINUTES: int = 20
-    ATR_PERIOD: int = 14
+    # paper params / execution params
+    TRADE_NOTIONAL_USD: float
+    TP_PCT: float
+    SL_PCT: float
+    MAX_HOLDING_SEC: int
+    IMPULSE_LOOKBACK_SEC: int
+    BREAKOUT_BUFFER_PCT: float
 
-    WHITELIST_BYPASS_LIQUIDITY: bool = False
-    WHITELIST_PRIORITY: bool = True
+    COOLDOWN_AFTER_TRADE_SEC: int
+    MAX_TRADES_PER_HOUR: int
 
-    # paper trading params
-    TRADE_NOTIONAL_USD: float = 50.0
-    TP_PCT: float = 0.6
-    SL_PCT: float = 0.2
-    MAX_HOLDING_SEC: int = 600
-    BREAKOUT_BUFFER_PCT: float = 0.10
-    IMPULSE_LOOKBACK_SEC: int = 10
+    # risk pauses (paper) - can be disabled with 0
+    MAX_CONSECUTIVE_LOSSES: int
+    PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC: int
+    SYMBOL_MAX_SL_STREAK: int
+    SYMBOL_PAUSE_AFTER_SL_STREAK_SEC: int
 
-    COOLDOWN_AFTER_TRADE_SEC: int = 0
-    MAX_TRADES_PER_HOUR: int = 0  # 0 => unlimited (disabled)
-
-    # risk pauses (0 => disabled)
-    MAX_CONSECUTIVE_LOSSES: int = 0
-    PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC: int = 0
-    SYMBOL_MAX_SL_STREAK: int = 0
-    SYMBOL_PAUSE_AFTER_SL_STREAK_SEC: int = 0
 
 def load_config() -> Config:
-    rest = os.getenv("ASTER_REST_BASE", "https://fapi.asterdex.com").rstrip("/")
-    ws = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
+    # accept both old and new env var names
+    rest = (os.getenv("ASTER_REST_BASE") or os.getenv("REST_BASE") or "https://fapi.asterdex.com").rstrip("/")
+    ws = (os.getenv("ASTER_WS_BASE") or os.getenv("WS_BASE") or "wss://fstream.asterdex.com").rstrip("/")
 
-    cfg = Config(
+    symbol_mode = (os.getenv("SYMBOL_MODE") or "HYBRID_PRIORITY").strip().upper()
+    quote = (os.getenv("QUOTE") or "USDT").strip().upper()
+
+    active_symbols = _csv_list(os.getenv("ACTIVE_SYMBOLS", ""))
+
+    return Config(
         REST_BASE=rest,
         WS_BASE=ws,
-        QUOTE=os.getenv("QUOTE", "USDT").strip().upper(),
 
-        SYMBOL_MODE=os.getenv("SYMBOL_MODE", "HYBRID_PRIORITY").strip().upper(),
-        ACTIVE_SYMBOLS=_csv(os.getenv("ACTIVE_SYMBOLS", "")),
-        WHITELIST=_csv(os.getenv("WHITELIST", "")),
-        BLACKLIST=_csv(os.getenv("BLACKLIST", "")),
-        LIVE_ALLOW_SYMBOLS=_csv(os.getenv("LIVE_ALLOW_SYMBOLS", "")),
+        SYMBOL_MODE=symbol_mode,
+        QUOTE=quote,
+        ACTIVE_SYMBOLS=active_symbols,
+        TARGET_SYMBOLS=_to_int(os.getenv("TARGET_SYMBOLS"), 15),
+        AUTO_TOP_N=_to_int(os.getenv("AUTO_TOP_N"), 40),
+        REFRESH_UNIVERSE_SEC=_to_int(os.getenv("REFRESH_UNIVERSE_SEC"), 900),
 
-        AUTO_TOP_N=_i(os.getenv("AUTO_TOP_N", "40"), 40),
-        TARGET_SYMBOLS=_i(os.getenv("TARGET_SYMBOLS", "20"), 20),
-        REFRESH_UNIVERSE_SEC=_i(os.getenv("REFRESH_UNIVERSE_SEC", "900"), 900),
+        WHITELIST=_csv_list(os.getenv("WHITELIST", "")),
+        BLACKLIST=_csv_list(os.getenv("BLACKLIST", "")),
+        WHITELIST_PRIORITY=_to_bool(os.getenv("WHITELIST_PRIORITY"), True),
+        WHITELIST_BYPASS_LIQUIDITY=_to_bool(os.getenv("WHITELIST_BYPASS_LIQUIDITY"), False),
 
-        MIN_24H_QUOTE_VOL=_f(os.getenv("MIN_24H_QUOTE_VOL", "3000000"), 3_000_000.0),
-        MAX_SPREAD_PCT=_f(os.getenv("MAX_SPREAD_PCT", "0.1"), 0.10),
-        MIN_ATR_PCT=_f(os.getenv("MIN_ATR_PCT", "0.03"), 0.03),
+        MIN_24H_QUOTE_VOL=_to_float(os.getenv("MIN_24H_QUOTE_VOL"), 3_000_000.0),
+        MAX_SPREAD_PCT=_to_float(os.getenv("MAX_SPREAD_PCT"), 0.10),
+        MIN_ATR_PCT=_to_float(os.getenv("MIN_ATR_PCT"), 0.03),
+        TF_SEC=_to_int(os.getenv("TF_SEC"), 60),
+        LOOKBACK_MINUTES=_to_int(os.getenv("LOOKBACK_MINUTES"), 20),
+        ATR_PERIOD=_to_int(os.getenv("ATR_PERIOD"), 14),
 
-        TF_SEC=_i(os.getenv("TF_SEC", "60"), 60),
-        LOOKBACK_MINUTES=_i(os.getenv("LOOKBACK_MINUTES", "20"), 20),
-        ATR_PERIOD=_i(os.getenv("ATR_PERIOD", "14"), 14),
+        TRADE_NOTIONAL_USD=_to_float(os.getenv("TRADE_NOTIONAL_USD"), 50.0),
+        TP_PCT=_to_float(os.getenv("TP_PCT"), 0.6),
+        SL_PCT=_to_float(os.getenv("SL_PCT"), 0.2),
+        MAX_HOLDING_SEC=_to_int(os.getenv("MAX_HOLDING_SEC"), 600),
+        IMPULSE_LOOKBACK_SEC=_to_int(os.getenv("IMPULSE_LOOKBACK_SEC"), 10),
+        BREAKOUT_BUFFER_PCT=_to_float(os.getenv("BREAKOUT_BUFFER_PCT"), 0.10),
 
-        WHITELIST_BYPASS_LIQUIDITY=_b(os.getenv("WHITELIST_BYPASS_LIQUIDITY", "false")),
-        WHITELIST_PRIORITY=_b(os.getenv("WHITELIST_PRIORITY", "true"), True),
+        COOLDOWN_AFTER_TRADE_SEC=_to_int(os.getenv("COOLDOWN_AFTER_TRADE_SEC"), 0),
+        MAX_TRADES_PER_HOUR=_to_int(os.getenv("MAX_TRADES_PER_HOUR"), 0),
 
-        TRADE_NOTIONAL_USD=_f(os.getenv("TRADE_NOTIONAL_USD", "50"), 50.0),
-        TP_PCT=_f(os.getenv("TP_PCT", "0.6"), 0.6),
-        SL_PCT=_f(os.getenv("SL_PCT", "0.2"), 0.2),
-        MAX_HOLDING_SEC=_i(os.getenv("MAX_HOLDING_SEC", "600"), 600),
-        BREAKOUT_BUFFER_PCT=_f(os.getenv("BREAKOUT_BUFFER_PCT", "0.1"), 0.10),
-        IMPULSE_LOOKBACK_SEC=_i(os.getenv("IMPULSE_LOOKBACK_SEC", "10"), 10),
-
-        COOLDOWN_AFTER_TRADE_SEC=_i(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "0"), 0),
-        MAX_TRADES_PER_HOUR=_i(os.getenv("MAX_TRADES_PER_HOUR", "0"), 0),
-
-        MAX_CONSECUTIVE_LOSSES=_i(os.getenv("MAX_CONSECUTIVE_LOSSES", "0"), 0),
-        PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC=_i(os.getenv("PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC", "0"), 0),
-        SYMBOL_MAX_SL_STREAK=_i(os.getenv("SYMBOL_MAX_SL_STREAK", "0"), 0),
-        SYMBOL_PAUSE_AFTER_SL_STREAK_SEC=_i(os.getenv("SYMBOL_PAUSE_AFTER_SL_STREAK_SEC", "0"), 0),
+        MAX_CONSECUTIVE_LOSSES=_to_int(os.getenv("MAX_CONSECUTIVE_LOSSES"), 0),
+        PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC=_to_int(os.getenv("PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC"), 0),
+        SYMBOL_MAX_SL_STREAK=_to_int(os.getenv("SYMBOL_MAX_SL_STREAK"), 0),
+        SYMBOL_PAUSE_AFTER_SL_STREAK_SEC=_to_int(os.getenv("SYMBOL_PAUSE_AFTER_SL_STREAK_SEC"), 0),
     )
-
-    # Normalize empties to []
-    cfg.ACTIVE_SYMBOLS = cfg.ACTIVE_SYMBOLS or []
-    cfg.WHITELIST = cfg.WHITELIST or []
-    cfg.BLACKLIST = cfg.BLACKLIST or []
-    cfg.LIVE_ALLOW_SYMBOLS = cfg.LIVE_ALLOW_SYMBOLS or []
-    return cfg
