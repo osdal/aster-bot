@@ -1,86 +1,104 @@
 ﻿import os
+import re
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
+
+def _parse_int(name: str, default: int) -> int:
+    """
+    Robust int parser for .env values.
+    Accepts values like "20", " 20 ", "20A", "20А" (Cyrillic A), "20.0".
+    Extracts the first integer token; falls back to default.
+    """
+    raw = os.getenv(name, "")
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        return default
+
+    # try straight int first
+    try:
+        return int(s)
+    except Exception:
+        pass
+
+    # extract leading numeric token
+    m = re.search(r"-?\d+", s)
+    if not m:
+        return default
+    try:
+        return int(m.group(0))
+    except Exception:
+        return default
+
+
+def _parse_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "")
+    if raw is None:
+        return default
+    s = str(raw).strip().replace(",", ".")
+    if not s:
+        return default
+    try:
+        return float(s)
+    except Exception:
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        if not m:
+            return default
+        try:
+            return float(m.group(0))
+        except Exception:
+            return default
 
 
 @dataclass
 class Config:
-    # Endpoints
-    REST_BASE: str
-    WS_BASE: str
+    # market selection / universe
+    SYMBOL_MODE: str = "HYBRID_PRIORITY"     # HYBRID_PRIORITY | MANUAL | TOPVOL | etc (depends on universe.py)
+    TARGET_SYMBOLS: int = 15
 
-    # Universe selection
-    SYMBOL_MODE: str              # e.g. "HYBRID_PRIORITY", "HYBRID", "TOP_VOLUME", "LIST"
-    TARGET_SYMBOLS: int           # how many symbols to subscribe/trade in paper
-    SYMBOLS_LIST: str             # comma-separated, used when SYMBOL_MODE="LIST"
+    MIN_24H_QUOTE_VOL: float = 3_000_000.0  # USDT quote volume filter
+    MIN_ATR_PCT: float = 0.12               # % ATR(??) filter (implementation in universe.py)
+    MAX_SPREAD_PCT: float = 0.06            # max spread (%)
 
-    MIN_ATR_PCT: float            # e.g. 0.20  (percent)
-    MAX_SPREAD_PCT: float         # e.g. 0.15  (percent)
-    MIN_24H_QUOTE_VOL: float      # in USDT
+    # paper execution
+    TRADE_NOTIONAL_USD: float = 75.0
+    TP_PCT: float = 0.60
+    SL_PCT: float = 0.20
+    MAX_HOLDING_SEC: int = 420
+    COOLDOWN_AFTER_TRADE_SEC: int = 120
+    MAX_TRADES_PER_HOUR: int = 6
 
-    # Paper trading params
-    TRADE_NOTIONAL_USD: float     # paper notional per position
-    TP_PCT: float                 # take profit in percent, e.g. 0.60
-    SL_PCT: float                 # stop loss in percent, e.g. 0.20
-    MAX_HOLDING_SEC: int          # timeout in seconds
-    COOLDOWN_AFTER_TRADE_SEC: int # per-symbol cooldown (paper)
-    MAX_TRADES_PER_HOUR: int      # paper global rate limit
+    # risk pauses (DISABLED by default; set >0 to enable)
+    MAX_CONSECUTIVE_LOSSES: int = 0
+    PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC: int = 0
+    SYMBOL_MAX_SL_STREAK: int = 0
+    SYMBOL_PAUSE_AFTER_SL_STREAK_SEC: int = 0
 
-    # Breakout/impulse logic (run_paper.py uses these)
-    IMPULSE_LOOKBACK_SEC: int
-    BREAKOUT_BUFFER_PCT: float
-
-    # (legacy risk controls; may be ignored by NO_PAUSES paper_engine)
-    MAX_CONSECUTIVE_LOSSES: int
-    PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC: int
-    SYMBOL_MAX_SL_STREAK: int
-    SYMBOL_PAUSE_AFTER_SL_STREAK_SEC: int
-
-
-def _env_float(name: str, default: str) -> float:
-    v = os.getenv(name, default).strip()
-    return float(v.replace(",", "."))
-
-
-def _env_int(name: str, default: str) -> int:
-    v = os.getenv(name, default).strip()
-    # protect from accidental Cyrillic 'А' etc.
-    v = "".join(ch for ch in v if ch.isdigit() or ch in "+-")
-    return int(v) if v else int(default)
+    # websocket base
+    WS_BASE: str = "wss://fstream.asterdex.com/stream?streams="
 
 
 def load_config() -> Config:
-    load_dotenv()
-
-    rest_base = os.getenv("ASTER_REST_BASE", "https://fapi.asterdex.com").strip().rstrip("/")
-    ws_base = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").strip().rstrip("/")
-
     return Config(
-        REST_BASE=rest_base,
-        WS_BASE=ws_base,
+        SYMBOL_MODE=os.getenv("SYMBOL_MODE", "HYBRID_PRIORITY").strip(),
+        TARGET_SYMBOLS=_parse_int("TARGET_SYMBOLS", 15),
 
-        SYMBOL_MODE=os.getenv("SYMBOL_MODE", "HYBRID_PRIORITY").strip().upper(),
-        TARGET_SYMBOLS=_env_int("TARGET_SYMBOLS", "15"),
-        SYMBOLS_LIST=os.getenv("SYMBOLS_LIST", "").strip(),
+        MIN_24H_QUOTE_VOL=_parse_float("MIN_24H_QUOTE_VOL", 3_000_000.0),
+        MIN_ATR_PCT=_parse_float("MIN_ATR_PCT", 0.12),
+        MAX_SPREAD_PCT=_parse_float("MAX_SPREAD_PCT", 0.06),
 
-        MIN_ATR_PCT=_env_float("MIN_ATR_PCT", "0.20"),
-        MAX_SPREAD_PCT=_env_float("MAX_SPREAD_PCT", "0.15"),
-        MIN_24H_QUOTE_VOL=_env_float("MIN_24H_QUOTE_VOL", "2000000"),
+        TRADE_NOTIONAL_USD=_parse_float("TRADE_NOTIONAL_USD", 75.0),
+        TP_PCT=_parse_float("TP_PCT", 0.60),
+        SL_PCT=_parse_float("SL_PCT", 0.20),
+        MAX_HOLDING_SEC=_parse_int("MAX_HOLDING_SEC", 420),
+        COOLDOWN_AFTER_TRADE_SEC=_parse_int("COOLDOWN_AFTER_TRADE_SEC", 120),
+        MAX_TRADES_PER_HOUR=_parse_int("MAX_TRADES_PER_HOUR", 6),
 
-        TRADE_NOTIONAL_USD=_env_float("TRADE_NOTIONAL_USD", "75"),
-        TP_PCT=_env_float("TP_PCT", "0.60"),
-        SL_PCT=_env_float("SL_PCT", "0.20"),
-        MAX_HOLDING_SEC=_env_int("MAX_HOLDING_SEC", "420"),
-        COOLDOWN_AFTER_TRADE_SEC=_env_int("COOLDOWN_AFTER_TRADE_SEC", "0"),
-        MAX_TRADES_PER_HOUR=_env_int("MAX_TRADES_PER_HOUR", "999999"),
+        MAX_CONSECUTIVE_LOSSES=_parse_int("MAX_CONSECUTIVE_LOSSES", 0),
+        PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC=_parse_int("PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC", 0),
+        SYMBOL_MAX_SL_STREAK=_parse_int("SYMBOL_MAX_SL_STREAK", 0),
+        SYMBOL_PAUSE_AFTER_SL_STREAK_SEC=_parse_int("SYMBOL_PAUSE_AFTER_SL_STREAK_SEC", 0),
 
-        IMPULSE_LOOKBACK_SEC=_env_int("IMPULSE_LOOKBACK_SEC", "10"),
-        BREAKOUT_BUFFER_PCT=_env_float("BREAKOUT_BUFFER_PCT", "0.10"),
-
-        # defaults = disabled (your new logic uses per-symbol streaks, not global pauses)
-        MAX_CONSECUTIVE_LOSSES=_env_int("MAX_CONSECUTIVE_LOSSES", "999999"),
-        PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC=_env_int("PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC", "0"),
-        SYMBOL_MAX_SL_STREAK=_env_int("SYMBOL_MAX_SL_STREAK", "999999"),
-        SYMBOL_PAUSE_AFTER_SL_STREAK_SEC=_env_int("SYMBOL_PAUSE_AFTER_SL_STREAK_SEC", "0"),
+        WS_BASE=os.getenv("WS_BASE", "wss://fstream.asterdex.com/stream?streams=").strip(),
     )
