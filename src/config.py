@@ -36,6 +36,9 @@ class Config:
     MAX_HOLDING_SEC: int
     COOLDOWN_AFTER_TRADE_SEC: int
 
+    # optional throttle (PaperEngine reads via getattr)
+    MAX_TRADES_PER_HOUR: int
+
 
 def _parse_bool(v: str, default: bool = False) -> bool:
     if v is None:
@@ -57,7 +60,9 @@ def load_config() -> Config:
         REST_BASE=os.getenv("ASTER_REST_BASE", "https://fapi.asterdex.com").rstrip("/"),
         WS_BASE=os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/"),
 
+        # Yes: SYMBOL_MODE=HYBRID_PRIORITY will work (it’s just a string selector for universe.py)
         SYMBOL_MODE=os.getenv("SYMBOL_MODE", "HYBRID_PRIORITY").strip().upper(),
+
         WHITELIST=_parse_list_set(os.getenv("WHITELIST", "")),
         BLACKLIST=_parse_list_set(os.getenv("BLACKLIST", "")),
         QUOTE=os.getenv("QUOTE", "USDT").strip().upper(),
@@ -79,8 +84,14 @@ def load_config() -> Config:
 
         TRADE_NOTIONAL_USD=float(os.getenv("TRADE_NOTIONAL_USD", "75")),
         BREAKOUT_BUFFER_PCT=float(os.getenv("BREAKOUT_BUFFER_PCT", "0.05")),
-        TP_PCT=float(os.getenv("TP_PCT", "0.35")),
-        SL_PCT=float(os.getenv("SL_PCT", "0.25")),
+
+        # Your current target: TP=0.6%, SL=0.2%
+        TP_PCT=float(os.getenv("TP_PCT", "0.6")),
+        SL_PCT=float(os.getenv("SL_PCT", "0.2")),
+
         MAX_HOLDING_SEC=int(os.getenv("MAX_HOLDING_SEC", "600")),
-        COOLDOWN_AFTER_TRADE_SEC=int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "120")),
+        COOLDOWN_AFTER_TRADE_SEC=int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "0")),
+
+        # set very high to effectively disable throttling
+        MAX_TRADES_PER_HOUR=int(os.getenv("MAX_TRADES_PER_HOUR", "999999")),
     )
