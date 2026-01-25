@@ -18,26 +18,17 @@ class Position:
 
 class PaperEngine:
     """
-    PAPER execution engine.
-
-    Key changes vs older version:
-      - Global pause and per-symbol pause are DISABLED by default.
-      - They can be enabled only if cfg.* pause params are set > 0.
-      - This aligns with Strategy A: selection is done by per-symbol loss streak in mirror_paper_to_live.py,
-        not by paper engine "stop trading" pauses.
+    PAPER engine without pauses.
+    - No global pauses and no per-symbol pauses (your 3-loss logic is handled in mirror_paper_to_live.py).
+    - MAX_TRADES_PER_HOUR=0 means "unlimited" (not "block all").
     """
     def __init__(self, cfg):
         self.cfg = cfg
         self.pos: dict[str, Position] = {}
         self.last_trade_ts: dict[str, int] = {}
 
-        # (optional) pause mechanics — disabled unless cfg enables them
-        self.consecutive_losses = 0
-        self.pause_until_ts = 0
+        # optional rate-limit (0 => unlimited)
         self.trades_window = deque()  # timestamps of closes for rate-limit
-
-        self.symbol_sl_streak: dict[str, int] = {}
-        self.symbol_pause_until: dict[str, int] = {}
 
         self.trades_path = "data/paper_trades.csv"
         os.makedirs("data", exist_ok=True)
@@ -57,48 +48,34 @@ class PaperEngine:
         while self.trades_window and (now_ts - self.trades_window[0]) > 3600:
             self.trades_window.popleft()
 
-    def _is_globally_paused(self, now: int) -> bool:
-        return now < self.pause_until_ts
-
-    def _is_symbol_paused(self, symbol: str, now: int) -> bool:
-        return now < self.symbol_pause_until.get(symbol, 0)
-
     def can_open(self, symbol: str) -> bool:
         now = self._now()
 
-        # pauses (if enabled)
-        if self._is_globally_paused(now):
-            return False
-        if self._is_symbol_paused(symbol, now):
-            return False
-
-        # one position per symbol
         if symbol in self.pos:
             return False
 
-        # cooldown per symbol
+        # cooldown per symbol (0 => disabled)
+        cooldown_sec = int(getattr(self.cfg, "COOLDOWN_AFTER_TRADE_SEC", 0))
         last = self.last_trade_ts.get(symbol, 0)
-        cooldown = int(getattr(self.cfg, "COOLDOWN_AFTER_TRADE_SEC", 120))
-        if cooldown > 0 and (now - last) < cooldown:
+        if cooldown_sec > 0 and (now - last) < cooldown_sec:
             return False
 
-        # max trades per hour
-        max_per_hour = int(getattr(self.cfg, "MAX_TRADES_PER_HOUR", 6))
-        if max_per_hour > 0:
-            self._cleanup_trades_window(now)
-            if len(self.trades_window) >= max_per_hour:
-                return False
+        # max trades per hour (0 => unlimited)
+        max_per_hour = int(getattr(self.cfg, "MAX_TRADES_PER_HOUR", 0))
+        self._cleanup_trades_window(now)
+        if max_per_hour > 0 and len(self.trades_window) >= max_per_hour:
+            return False
 
         return True
 
     def open_position(self, symbol: str, side: str, price: float):
-        notional = float(getattr(self.cfg, "TRADE_NOTIONAL_USD", 75))
+        notional = float(getattr(self.cfg, "TRADE_NOTIONAL_USD", 50))
         qty = notional / price if price > 0 else 0.0
         if qty <= 0:
             return
 
-        tp_pct = float(getattr(self.cfg, "TP_PCT", 0.60)) / 100.0
-        sl_pct = float(getattr(self.cfg, "SL_PCT", 0.20)) / 100.0
+        tp_pct = float(getattr(self.cfg, "TP_PCT", 0.6)) / 100.0
+        sl_pct = float(getattr(self.cfg, "SL_PCT", 0.2)) / 100.0
 
         if side == "LONG":
             tp = price * (1.0 + tp_pct)
@@ -109,44 +86,6 @@ class PaperEngine:
 
         self.pos[symbol] = Position(symbol, side, price, qty, tp, sl, self._now())
         print(f"[PAPER] OPEN {symbol} {side} entry={price:.6g} tp={tp:.6g} sl={sl:.6g}")
-
-    def _apply_global_risk_after_close(self, pnl_usd: float):
-        max_losses = int(getattr(self.cfg, "MAX_CONSECUTIVE_LOSSES", 0))
-        pause_sec = int(getattr(self.cfg, "PAUSE_AFTER_CONSECUTIVE_LOSSES_SEC", 0))
-
-        # disabled unless explicitly enabled
-        if max_losses <= 0 or pause_sec <= 0:
-            self.consecutive_losses = 0
-            return
-
-        if pnl_usd < 0:
-            self.consecutive_losses += 1
-        else:
-            self.consecutive_losses = 0
-
-        if self.consecutive_losses >= max_losses:
-            self.pause_until_ts = self._now() + pause_sec
-            print(f"[RISK] GLOBAL PAUSE {pause_sec}s (consecutive_losses={self.consecutive_losses})")
-
-    def _apply_symbol_risk_after_close(self, symbol: str, reason: str):
-        max_streak = int(getattr(self.cfg, "SYMBOL_MAX_SL_STREAK", 0))
-        pause_sec = int(getattr(self.cfg, "SYMBOL_PAUSE_AFTER_SL_STREAK_SEC", 0))
-
-        # disabled unless explicitly enabled
-        if max_streak <= 0 or pause_sec <= 0:
-            self.symbol_sl_streak[symbol] = 0
-            return
-
-        if reason == "SL":
-            self.symbol_sl_streak[symbol] = self.symbol_sl_streak.get(symbol, 0) + 1
-        else:
-            # any non-SL close resets SL streak
-            self.symbol_sl_streak[symbol] = 0
-
-        if self.symbol_sl_streak.get(symbol, 0) >= max_streak:
-            self.symbol_pause_until[symbol] = self._now() + pause_sec
-            self.symbol_sl_streak[symbol] = 0
-            print(f"[RISK] SYMBOL PAUSE {symbol} for {pause_sec}s (SL streak reached)")
 
     def _close(self, symbol: str, exit_price: float, reason: str):
         p = self.pos.pop(symbol, None)
@@ -171,16 +110,13 @@ class PaperEngine:
             w = csv.writer(f)
             w.writerow([now, symbol, p.side, p.entry_price, exit_price, pnl, pnl_pct, reason, hold])
 
-        self._apply_global_risk_after_close(pnl)
-        self._apply_symbol_risk_after_close(symbol, reason)
-
     def on_price(self, symbol: str, price: float):
         p = self.pos.get(symbol)
         if not p:
             return
 
         now = self._now()
-        max_hold = int(getattr(self.cfg, "MAX_HOLDING_SEC", 420))
+        max_hold = int(getattr(self.cfg, "MAX_HOLDING_SEC", 600))
         if max_hold > 0 and now - p.opened_at >= max_hold:
             self._close(symbol, price, "TIMEOUT")
             return
