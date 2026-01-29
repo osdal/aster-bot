@@ -1,32 +1,33 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mirror_paper_to_live_FIXED.py
+mirror_paper_to_live.py
 
-Strategy A (Freeze + GlobalReset) — РАБОЧАЯ ВЕРСИЯ.
+Strategy A (Freeze + Global Reset) по ТЗ:
 
-Логика по ТЗ:
-1) PAPER торгует по всем символам и считает "серии подряд минусов" по КАЖДОЙ паре.
+1) PAPER торгует по всем разрешённым символам и считает серии подряд минусов (LOSS STREAK) по каждой паре.
    Минус = закрытие по SL.
-   TIMEOUT: если netPnL >= 0 -> плюс (сброс серии); если netPnL < 0 -> минус (увеличиваем серию).
-   TP = плюс (сброс серии).
+   TIMEOUT: если netPnL >= 0 -> считаем как плюс (сброс серии); если netPnL < 0 -> считаем как минус (увеличиваем серию).
+   TP всегда плюс (сброс серии).
 
 2) Когда по ЛЮБОЙ паре серия подряд минусов достигает LOSS_STREAK_TO_ARM:
    - PAPER ПЕРЕСТАЁТ ОТКРЫВАТЬ НОВЫЕ СДЕЛКИ ВООБЩЕ (по всем парам).
    - Запоминаем trigger_symbol = та пара, которая первой достигла порога.
-   - Дальше мы ЖДЁМ НОВЫЙ СИГНАЛ НА ВХОД по trigger_symbol.
-   - Как только сигнал появился и по trigger_symbol нет открытой PAPER позиции -> ОТКРЫВАЕМ LIVE.
+   - Дальше ЖДЁМ НОВЫЙ СИГНАЛ на вход по trigger_symbol (именно сигнал, а не существующую открытую PAPER позицию).
+   - Как только сигнал появился и по trigger_symbol нет открытой PAPER позиции -> ОТКРЫВАЕМ LIVE по этому сигналу.
 
 3) После закрытия LIVE (любой исход):
    - СБРАСЫВАЕМ СЧЁТЧИКИ СЕРИЙ МИНУСОВ У ВСЕХ ПАР СРАЗУ.
    - Снимаем глобальную паузу и PAPER снова начинает открывать сделки по всем парам.
 
-Фиксы:
-- Исправлен баг подписи запросов (urlencode вместо QueryParams.encode).
-- LIVE-watch запускается отдельной asyncio-задачей (WS не блокируется, last_price обновляется).
+ВАЖНОЕ исправление LIVE:
+- Не верим ответу MARKET-ордера (часто avgPrice/executedQty=0).
+- После входа ждём реальную позицию через positionRisk (qty/entry) и только потом считаем/закрываем.
+- При закрытии берём qty из positionRisk, чтобы не закрывать quantity=0.
 
-Зависимости:
-pip install websockets httpx python-dotenv
+Требования:
+- Python 3.10+
+- pip install websockets httpx python-dotenv
 """
 
 from __future__ import annotations
@@ -110,6 +111,20 @@ def _round_step(x: float, step: float) -> float:
 def _sign_hmac_sha256(secret: str, query_string: str) -> str:
     return hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
+def _parse_position_risk_payload(payload):
+    # positionRisk может быть list[dict] или dict
+    if isinstance(payload, list) and payload:
+        return payload[0]
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+def _to_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
 
 @dataclass
 class Config:
@@ -158,6 +173,7 @@ class Config:
     LIVE_LEVERAGE: int = 2
     LIVE_MAX_POSITIONS: int = 1
     MAX_DEVIATION_PCT: float = 0.20
+    MIN_NOTIONAL_BUFFER_PCT: float = 5.0
 
     # watch / timeouts
     WATCH_POLL_SEC: float = 2.0
@@ -169,7 +185,6 @@ class Config:
     ASTER_API_SECRET: str = ""
 
     # misc
-    CLEANUP_ON_EXIT: bool = False
     DEBUG: bool = False
 
     @staticmethod
@@ -221,6 +236,7 @@ class Config:
         cfg.LIVE_LEVERAGE = _env_int("LIVE_LEVERAGE", cfg.LIVE_LEVERAGE)
         cfg.LIVE_MAX_POSITIONS = _env_int("LIVE_MAX_POSITIONS", cfg.LIVE_MAX_POSITIONS)
         cfg.MAX_DEVIATION_PCT = _env_float("MAX_DEVIATION_PCT", cfg.MAX_DEVIATION_PCT)
+        cfg.MIN_NOTIONAL_BUFFER_PCT = _env_float("MIN_NOTIONAL_BUFFER_PCT", cfg.MIN_NOTIONAL_BUFFER_PCT)
 
         cfg.WATCH_POLL_SEC = _env_float("WATCH_POLL_SEC", cfg.WATCH_POLL_SEC)
         cfg.WATCH_PROFIT_TIMEOUT_SEC = _env_int("WATCH_PROFIT_TIMEOUT_SEC", cfg.WATCH_PROFIT_TIMEOUT_SEC)
@@ -229,7 +245,6 @@ class Config:
         cfg.ASTER_API_KEY = _env_str("ASTER_API_KEY", "")
         cfg.ASTER_API_SECRET = _env_str("ASTER_API_SECRET", "")
 
-        cfg.CLEANUP_ON_EXIT = _env_bool("CLEANUP_ON_EXIT", cfg.CLEANUP_ON_EXIT)
         cfg.DEBUG = _env_bool("DEBUG", cfg.DEBUG)
 
         return cfg
@@ -242,11 +257,8 @@ class Config:
 class AsterFapi:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.client = httpx.AsyncClient(
-            base_url=cfg.REST_BASE,
-            timeout=15.0,
-            headers={"X-MBX-APIKEY": cfg.ASTER_API_KEY} if cfg.ASTER_API_KEY else {},
-        )
+        headers = {"X-MBX-APIKEY": cfg.ASTER_API_KEY} if cfg.ASTER_API_KEY else {}
+        self.client = httpx.AsyncClient(base_url=cfg.REST_BASE, timeout=15.0, headers=headers)
         self._exchange_info = None
         self._symbol_filters: Dict[str, Dict[str, float]] = {}
 
@@ -265,7 +277,7 @@ class AsterFapi:
         params = dict(params or {})
         params["timestamp"] = _now_ms()
 
-        # FIX: правильная строка подписи
+        # ВАЖНО: универсально для разных httpx — не используем QueryParams.encode()
         query = urlencode(params, doseq=True)
         sig = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, query)
         params["signature"] = sig
@@ -297,6 +309,7 @@ class AsterFapi:
                 min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
             elif "NOTIONAL" in filters:
                 min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
+
             self._symbol_filters[sym] = {"stepSize": step, "minQty": min_qty, "minNotional": min_notional}
 
     def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
@@ -325,6 +338,12 @@ class AsterFapi:
             params["reduceOnly"] = "true"
         return await self._signed("POST", "/fapi/v1/order", params)
 
+    async def position_risk(self, symbol: str):
+        try:
+            return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        except Exception:
+            return await self._signed("GET", "/fapi/v1/positionRisk", {"symbol": symbol})
+
 
 # =========================
 # Market data + indicators
@@ -341,9 +360,8 @@ class Bar:
 class IndicatorState:
     def __init__(self, tf_sec: int, max_bars: int):
         self.tf_ms = tf_sec * 1000
-        self.max_bars = max_bars
         self.bars: Deque[Bar] = deque(maxlen=max_bars)
-        self._cur_bucket = None  # [bucket_ts, o,h,l,c]
+        self._cur_bucket = None  # [bts, o, h, l, c]
 
     def update_trade(self, ts_ms: int, price: float):
         bts = (ts_ms // self.tf_ms) * self.tf_ms
@@ -363,7 +381,7 @@ class IndicatorState:
         bars = list(self.bars)[-(period + 1):]
         trs = []
         for i in range(1, len(bars)):
-            prev_close = bars[i - 1].c
+            prev_close = bars[i-1].c
             high = bars[i].h
             low = bars[i].l
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
@@ -374,7 +392,7 @@ class IndicatorState:
 
 
 # =========================
-# Trading state
+# Trading state (PAPER)
 # =========================
 
 @dataclass
@@ -384,7 +402,7 @@ class Position:
     entry: float
     tp: float
     sl: float
-    opened_ts: float  # time.time()
+    opened_ts: float
 
 class PaperEngine:
     PAPER_CSV_HEADER = [
@@ -408,20 +426,24 @@ class PaperEngine:
             return False
         if symbol in self.positions:
             return False
+
         now = time.time()
         last = self.last_trade_ts.get(symbol, 0.0)
         if now - last < self.cfg.COOLDOWN_AFTER_TRADE_SEC:
             return False
+
         cutoff = now - 3600
         while self.trade_counts_hour and self.trade_counts_hour[0] < cutoff:
             self.trade_counts_hour.popleft()
         if len(self.trade_counts_hour) >= self.cfg.MAX_TRADES_PER_HOUR:
             return False
+
         return True
 
     def open(self, symbol: str, side: str, price: float):
         tp = price * (1 + self.cfg.TP_PCT / 100.0) if side == "LONG" else price * (1 - self.cfg.TP_PCT / 100.0)
         sl = price * (1 - self.cfg.SL_PCT / 100.0) if side == "LONG" else price * (1 + self.cfg.SL_PCT / 100.0)
+
         pos = Position(symbol=symbol, side=side, entry=price, tp=tp, sl=sl, opened_ts=time.time())
         self.positions[symbol] = pos
         self.last_trade_ts[symbol] = pos.opened_ts
@@ -452,6 +474,7 @@ class PaperEngine:
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
+
         pnl_pct = self._pnl_pct(pos, exit_price)
         net = self.cfg.TRADE_NOTIONAL_USD * (pnl_pct / 100.0)
 
@@ -470,15 +493,17 @@ class PaperEngine:
             "reason": reason
         })
 
+        # После freeze мы не хотим менять streak (по ТЗ — заморозка, ждём trigger-сигнал)
         if self.freeze_streak_updates:
             return
 
+        # Loss definition
         if reason == "SL":
             is_loss = True
         elif reason == "TP":
             is_loss = False
         elif reason == "TIMEOUT":
-            is_loss = net < 0
+            is_loss = net < 0  # net>=0 => win/reset
         else:
             is_loss = net < 0
 
@@ -501,33 +526,47 @@ class PaperEngine:
         if not pos:
             return
 
+        # TP/SL
         if pos.side == "LONG":
             if price >= pos.tp:
-                self.close(symbol, price, "TP"); return
+                self.close(symbol, price, "TP")
+                return
             if price <= pos.sl:
-                self.close(symbol, price, "SL"); return
+                self.close(symbol, price, "SL")
+                return
         else:
             if price <= pos.tp:
-                self.close(symbol, price, "TP"); return
+                self.close(symbol, price, "TP")
+                return
             if price >= pos.sl:
-                self.close(symbol, price, "SL"); return
+                self.close(symbol, price, "SL")
+                return
 
+        # TIMEOUT
         if self.cfg.MAX_HOLDING_SEC > 0 and (time.time() - pos.opened_ts) >= self.cfg.MAX_HOLDING_SEC:
             self.close(symbol, price, "TIMEOUT")
 
-    def reset_all_streaks(self, active_symbols: List[str]):
-        for s in active_symbols:
-            self.streak_losses[s] = 0
+    def reset_all_streaks(self):
+        # сбрасываем streak для всех известных символов
+        for k in list(self.streak_losses.keys()):
+            self.streak_losses[k] = 0
+        for sym in list(self.positions.keys()):
+            self.streak_losses.setdefault(sym, 0)
+
         self.freeze_paper_entries = False
         self.freeze_streak_updates = False
         self.trigger_symbol = None
         print("[RESET] Global reset: streaks=0 for all, PAPER resumes entries")
 
 
+# =========================
+# Signal Engine
+# =========================
+
 class SignalEngine:
     """
     Сигнал:
-    - берём изменение цены за IMPULSE_LOOKBACK_SEC
+    - изменение цены за IMPULSE_LOOKBACK_SEC
     - если abs(return_pct) >= BREAKOUT_BUFFER_PCT и ATR% >= MIN_ATR_PCT и spread <= MAX_SPREAD_PCT:
         LONG если return>0, SHORT если return<0
     """
@@ -575,6 +614,10 @@ class SignalEngine:
         return "LONG" if ret > 0 else "SHORT"
 
 
+# =========================
+# LIVE Engine (fixed qty/avg)
+# =========================
+
 class LiveEngine:
     LIVE_CSV_HEADER = [
         "ts", "symbol", "side", "entry", "exit", "qty", "leverage",
@@ -586,6 +629,26 @@ class LiveEngine:
         self.api = api
         self.open_positions: Dict[str, dict] = {}
 
+    async def _wait_position_opened(self, symbol: str, side: str, fallback_entry: float, timeout_sec: float = 6.0):
+        """
+        Ждём пока в positionRisk появится ненулевой positionAmt.
+        Берём qty=abs(positionAmt), entry=entryPrice (если 0 — берём fallback_entry).
+        """
+        t0 = time.time()
+        while time.time() - t0 < timeout_sec:
+            pr = await self.api.position_risk(symbol)
+            d = _parse_position_risk_payload(pr)
+            if d:
+                amt = _to_float(d.get("positionAmt", 0.0))
+                entry = _to_float(d.get("entryPrice", 0.0))
+                if abs(amt) > 0:
+                    qty = abs(amt)
+                    if entry <= 0:
+                        entry = fallback_entry
+                    return qty, entry
+            await asyncio.sleep(0.2)
+        return 0.0, 0.0
+
     async def open_live(self, symbol: str, side: str, last_price: float) -> dict:
         if len(self.open_positions) >= self.cfg.LIVE_MAX_POSITIONS:
             raise RuntimeError(f"LIVE_MAX_POSITIONS reached: {self.cfg.LIVE_MAX_POSITIONS}")
@@ -594,32 +657,42 @@ class LiveEngine:
         await self.api.set_leverage(symbol, int(self.cfg.LIVE_LEVERAGE))
 
         notional_effective = self.cfg.LIVE_NOTIONAL_USD * float(self.cfg.LIVE_LEVERAGE)
-        qty = notional_effective / last_price
+        qty_req = notional_effective / last_price
 
         f = self.api.get_symbol_filters(symbol)
         step = float(f.get("stepSize", 0.0) or 0.0)
         min_qty = float(f.get("minQty", 0.0) or 0.0)
 
-        qty = _round_step(qty, step) if step > 0 else qty
-        if qty < min_qty:
-            raise RuntimeError(f"Calculated qty {qty} < minQty {min_qty} for {symbol}. Increase LIVE_NOTIONAL_USD or leverage.")
+        qty_req = _round_step(qty_req, step) if step > 0 else qty_req
+        if qty_req < min_qty:
+            raise RuntimeError(
+                f"Calculated qty {qty_req} < minQty {min_qty} for {symbol}. "
+                f"Increase LIVE_NOTIONAL_USD or leverage."
+            )
 
         order_side = "BUY" if side == "LONG" else "SELL"
-        print(f"[LIVE] ENTRY {symbol} {side} market side={order_side} qty={qty:.8f} last={last_price:.6g}")
+        print(f"[LIVE] ENTRY {symbol} {side} market side={order_side} qty={qty_req:.8f} last={last_price:.6g}")
 
-        res = await self.api.place_order(symbol, order_side, qty, reduce_only=False)
+        res = await self.api.place_order(symbol, order_side, qty_req, reduce_only=False)
         order_id = res.get("orderId", "")
-        avg = float(res.get("avgPrice") or res.get("price") or last_price)
+
+        # FIX: ждём реальную позицию из positionRisk, а не верим avg/executedQty в ответе
+        qty, entry = await self._wait_position_opened(symbol, side, fallback_entry=last_price, timeout_sec=6.0)
+        if qty <= 0 or entry <= 0:
+            raise RuntimeError(
+                f"Live entry not confirmed (positionAmt/entryPrice not available). "
+                f"orderId={order_id} qty_req={qty_req}"
+            )
 
         self.open_positions[symbol] = {
             "symbol": symbol,
             "side": side,
-            "qty": float(res.get("executedQty") or qty),
-            "entry": avg,
+            "qty": float(qty),
+            "entry": float(entry),
             "opened_ts": time.time(),
             "order_id_entry": order_id,
         }
-        print(f"[LIVE] FILLED {symbol} avg={avg:.10f} executedQty={self.open_positions[symbol]['qty']:.8f} orderId={order_id}")
+        print(f"[LIVE] FILLED {symbol} entry={entry:.10f} executedQty={qty:.8f} orderId={order_id}")
         return self.open_positions[symbol]
 
     @staticmethod
@@ -635,16 +708,31 @@ class LiveEngine:
             raise RuntimeError(f"No live position for {symbol}")
 
         side = pos["side"]
-        qty = float(pos["qty"])
         close_side = "SELL" if side == "LONG" else "BUY"
+
+        # FIX: qty берём из positionRisk, чтобы не закрывать quantity=0
+        pr = await self.api.position_risk(symbol)
+        d = _parse_position_risk_payload(pr)
+        amt = _to_float(d.get("positionAmt", 0.0)) if d else 0.0
+        qty = abs(amt)
+        if qty <= 0:
+            qty = float(pos.get("qty", 0.0) or 0.0)
+        if qty <= 0:
+            raise RuntimeError(f"Cannot close {symbol}: qty is 0 (positionAmt=0).")
 
         res = await self.api.place_order(symbol, close_side, qty, reduce_only=True)
         order_id_exit = res.get("orderId", "")
-        avg_exit = float(res.get("avgPrice") or res.get("price") or exit_price)
+
+        avg_exit = _to_float(res.get("avgPrice"), 0.0)
+        if avg_exit <= 0:
+            avg_exit = _to_float(res.get("price"), 0.0)
+        if avg_exit <= 0:
+            avg_exit = float(exit_price)
 
         pnl_pct = self._pnl_pct(side, float(pos["entry"]), avg_exit)
         net = self.cfg.LIVE_NOTIONAL_USD * float(self.cfg.LIVE_LEVERAGE) * (pnl_pct / 100.0)
 
+        # outcome (формально для лога)
         outcome = "TP" if reason == "TP" else ("SL" if reason == "SL" else "TIMEOUT")
 
         print(f"[WATCH] {symbol}: LOGGED -> {self.cfg.LIVE_LOG_PATH} outcome={outcome} netPnL={net:+.10f} reason={reason}")
@@ -676,7 +764,7 @@ class LiveEngine:
         tp_pct: float,
         sl_pct: float,
         tick_price_getter,
-        stop_event: asyncio.Event,
+        stop_event: asyncio.Event
     ):
         tp = entry * (1 + tp_pct / 100.0) if side == "LONG" else entry * (1 - tp_pct / 100.0)
         sl = entry * (1 - sl_pct / 100.0) if side == "LONG" else entry * (1 + sl_pct / 100.0)
@@ -691,6 +779,7 @@ class LiveEngine:
             if not px or px <= 0:
                 continue
 
+            # TP/SL
             if side == "LONG":
                 if px >= tp:
                     return await self.close_live_market(symbol, px, "TP")
@@ -702,12 +791,14 @@ class LiveEngine:
                 if px >= sl:
                     return await self.close_live_market(symbol, px, "SL")
 
+            # PROFIT TIMEOUT
             if (not profit_timeout_fired) and self.cfg.WATCH_PROFIT_TIMEOUT_SEC > 0 and (time.time() - t0) >= self.cfg.WATCH_PROFIT_TIMEOUT_SEC:
                 profit_timeout_fired = True
                 pnl_pct = self._pnl_pct(side, entry, px)
                 if pnl_pct > 0:
                     return await self.close_live_market(symbol, px, "TIMEOUT_PROFIT")
 
+            # HARD TIMEOUT
             if self.cfg.WATCH_HARD_TIMEOUT_SEC > 0 and (time.time() - t0) >= self.cfg.WATCH_HARD_TIMEOUT_SEC:
                 return await self.close_live_market(symbol, px, "TIMEOUT_HARD")
 
@@ -729,23 +820,19 @@ class Orchestrator:
         self.last_price: Dict[str, float] = {}
         self.spread_cache: Dict[str, float] = {}
         self.live = LiveEngine(cfg, self.api)
-        self.stop_event = asyncio.Event()
 
+        self.stop_event = asyncio.Event()
         self.active_symbols: List[str] = []
+
         self._ws_task: Optional[asyncio.Task] = None
         self._universe_task: Optional[asyncio.Task] = None
         self._spread_task: Optional[asyncio.Task] = None
-
-        # FIX: watcher task (чтобы WS не блокировался)
-        self.live_active: bool = False
-        self.live_watch_task: Optional[asyncio.Task] = None
 
     async def build_universe(self) -> List[str]:
         wl = set(self.cfg.WHITELIST or [])
         bl = set(self.cfg.BLACKLIST or [])
         sk = set(self.cfg.SKIP_SYMBOLS or [])
 
-        syms: List[str] = []
         if self.cfg.SYMBOL_MODE.upper() == "WHITELIST_ONLY":
             syms = [s for s in wl if s and s not in bl and s not in sk]
         else:
@@ -768,6 +855,8 @@ class Orchestrator:
                     filtered.append((sym, qv))
                 filtered.sort(key=lambda x: x[1], reverse=True)
                 top = [sym for sym, _ in filtered[: self.cfg.AUTO_TOP_N]]
+
+                syms = []
                 if wl:
                     for s in wl:
                         if s in top and s not in syms:
@@ -777,6 +866,7 @@ class Orchestrator:
                             syms.append(s)
                 else:
                     syms = top
+
                 syms = syms[: self.cfg.TARGET_SYMBOLS]
 
         uniq = []
@@ -792,10 +882,12 @@ class Orchestrator:
             if syms and syms != self.active_symbols:
                 self.active_symbols = syms
                 print(f"[PAPER] Active symbols: {len(syms)} -> {','.join(syms)}")
+
                 max_bars = max(200, int(self.cfg.LOOKBACK_MINUTES * 60 / self.cfg.TF_SEC) + 10)
                 for s in syms:
                     self.indicators.setdefault(s, IndicatorState(self.cfg.TF_SEC, max_bars))
                     self.paper.streak_losses.setdefault(s, 0)
+
             await asyncio.sleep(self.cfg.REFRESH_UNIVERSE_SEC)
 
     async def spread_loop(self):
@@ -831,61 +923,41 @@ class Orchestrator:
     def _tick_price_getter(self, symbol: str) -> Optional[float]:
         return self.last_price.get(symbol)
 
-    async def _start_live_watcher(self, symbol: str, side: str, entry_price: float, sig: str):
-        """
-        Отдельная задача: открываем LIVE и сопровождаем, пока WS продолжает обновлять last_price.
-        """
-        try:
-            pos = await self.live.open_live(symbol, sig, entry_price)
-            await self.live.watch_until_close(
-                symbol=symbol,
-                side=pos["side"],
-                entry=float(pos["entry"]),
-                tp_pct=self.cfg.TP_PCT,
-                sl_pct=self.cfg.SL_PCT,
-                tick_price_getter=self._tick_price_getter,
-                stop_event=self.stop_event
-            )
-        except Exception as e:
-            print(f"[LIVE] WATCHER ERROR: {e}")
-        finally:
-            self.paper.reset_all_streaks(self.active_symbols)
-            self.live_active = False
-            self.live_watch_task = None
-
     async def _handle_trade_tick(self, symbol: str, price: float, ts_ms: int):
         self.last_price[symbol] = price
         self.signals.update(symbol, price)
         if symbol in self.indicators:
             self.indicators[symbol].update_trade(ts_ms, price)
 
-        # manage paper closes
+        # PAPER close management
         self.paper.maybe_close_on_price(symbol, price)
 
-        # generate signals
+        # signal
         atr_pct = self._get_atr_pct(symbol, price)
         spread_pct = self._get_spread_pct(symbol)
         sig = self.signals.signal_side(symbol, atr_pct, spread_pct)
         if not sig:
             return
 
+        # NORMAL: open PAPER
         if not self.paper.freeze_paper_entries:
             if self.cfg.PAPER_ENABLED and self.paper._can_open(symbol):
                 self.paper.open(symbol, sig, price)
             return
 
-        # frozen state: ONLY wait for a NEW signal on trigger_symbol to open LIVE
+        # FROZEN: wait NEW signal only for trigger_symbol
         trig = self.paper.trigger_symbol
         if not trig or symbol != trig:
             return
+
+        # require no open paper position on trigger symbol
         if symbol in self.paper.positions:
             return
-        if self.live_active:
-            return
 
+        # If LIVE disabled, just reset immediately
         if not self.cfg.LIVE_ENABLED:
             print("[LIVE] Skipped: LIVE_ENABLED=false. Still resetting.")
-            self.paper.reset_all_streaks(self.active_symbols)
+            self.paper.reset_all_streaks()
             return
 
         # deviation guard
@@ -899,18 +971,30 @@ class Orchestrator:
         except Exception:
             pass
 
-        # START LIVE watcher (НЕ блокируем WS)
-        self.live_active = True
-        self.live_watch_task = asyncio.create_task(self._start_live_watcher(symbol, sig, price, sig))
+        # OPEN LIVE
+        try:
+            pos = await self.live.open_live(symbol, sig, price)
+        except Exception as e:
+            print(f"[LIVE] ERROR: cannot open live: {e}")
+            return
+
+        # WATCH LIVE then RESET (any outcome)
+        try:
+            await self.live.watch_until_close(
+                symbol=symbol,
+                side=pos["side"],
+                entry=float(pos["entry"]),
+                tp_pct=self.cfg.TP_PCT,
+                sl_pct=self.cfg.SL_PCT,
+                tick_price_getter=self._tick_price_getter,
+                stop_event=self.stop_event
+            )
+        except Exception as e:
+            print(f"[LIVE] WATCHER ERROR: {e}")
+        finally:
+            self.paper.reset_all_streaks()
 
     async def ws_loop(self):
-        """
-        WS modes:
-        - COMBINED: /stream?streams=...
-        - SUBSCRIBE: /ws + {"method":"SUBSCRIBE","params":[...],"id":1}
-        AUTO:
-          если WS_BASE оканчивается на /ws -> SUBSCRIBE, иначе COMBINED
-        """
         while not self.stop_event.is_set():
             syms = list(self.active_symbols)
             if not syms:
@@ -945,6 +1029,7 @@ class Orchestrator:
                             if self.stop_event.is_set():
                                 break
                             await self._on_ws_message(msg)
+
             except Exception as e:
                 print(f"[WS] ERROR: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
@@ -955,7 +1040,7 @@ class Orchestrator:
         except Exception:
             return
 
-        # subscribe ack
+        # ignore subscribe ack
         if isinstance(data, dict) and data.get("result") is None and data.get("id") is not None:
             return
 
@@ -966,15 +1051,14 @@ class Orchestrator:
             return
 
         sym = (payload.get("s") or payload.get("symbol") or "").upper()
-        if not sym:
-            return
-        if sym not in self.active_symbols:
+        if not sym or sym not in self.active_symbols:
             return
 
         try:
             price = float(payload.get("p") or payload.get("price"))
         except Exception:
             return
+
         try:
             ts_ms = int(payload.get("T") or payload.get("tradeTime") or payload.get("E") or _now_ms())
         except Exception:
@@ -985,8 +1069,7 @@ class Orchestrator:
     async def run(self):
         print("[MIRROR] Strategy A (Freeze+GlobalReset): PAPER loss-streak -> FREEZE -> wait signal -> LIVE -> reset all streaks")
         print("[MIRROR] Flags: LIVE_ENABLED=", self.cfg.LIVE_ENABLED, "PAPER_ENABLED=", self.cfg.PAPER_ENABLED)
-        print("[MIRROR] Live: notional_usd=", self.cfg.LIVE_NOTIONAL_USD, "lev=", self.cfg.LIVE_LEVERAGE,
-              f"TP%={self.cfg.TP_PCT:.2f} SL%={self.cfg.SL_PCT:.3f}")
+        print("[MIRROR] Live: notional_usd=", self.cfg.LIVE_NOTIONAL_USD, "lev=", self.cfg.LIVE_LEVERAGE, f"TP%={self.cfg.TP_PCT:.2f} SL%={self.cfg.SL_PCT:.3f}")
         print("[MIRROR] LOSS_STREAK_TO_ARM=", self.cfg.LOSS_STREAK_TO_ARM, "LIVE_MAX_POSITIONS=", self.cfg.LIVE_MAX_POSITIONS)
         print("[MIRROR] WATCH_PROFIT_TIMEOUT_SEC=", self.cfg.WATCH_PROFIT_TIMEOUT_SEC, "WATCH_HARD_TIMEOUT_SEC=", self.cfg.WATCH_HARD_TIMEOUT_SEC)
         print("[MIRROR] PAPER_LOG_PATH=", self.cfg.PAPER_LOG_PATH)
@@ -995,8 +1078,10 @@ class Orchestrator:
         if self.cfg.LIVE_ENABLED and (not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET):
             raise RuntimeError("LIVE_ENABLED=true but ASTER_API_KEY/ASTER_API_SECRET are missing in environment.")
 
+        # initial universe
         self.active_symbols = await self.build_universe()
         print(f"[PAPER] Active symbols: {len(self.active_symbols)} -> {','.join(self.active_symbols)}")
+
         max_bars = max(200, int(self.cfg.LOOKBACK_MINUTES * 60 / self.cfg.TF_SEC) + 10)
         for s in self.active_symbols:
             self.indicators.setdefault(s, IndicatorState(self.cfg.TF_SEC, max_bars))
@@ -1008,8 +1093,7 @@ class Orchestrator:
 
         await self.stop_event.wait()
 
-        # shutdown
-        for t in [self._ws_task, self._spread_task, self._universe_task, self.live_watch_task]:
+        for t in [self._ws_task, self._spread_task, self._universe_task]:
             if t:
                 t.cancel()
         await self.api.close()
