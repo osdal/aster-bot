@@ -23,8 +23,9 @@ Strategy A (Freeze + Global Reset) по ТЗ:
 Критические фиксы:
 - Не используем httpx.QueryParams.encode() (ломается на разных версиях).
 - После MARKET-входа не верим avgPrice/executedQty в ответе, а ждём реальную позицию через positionRisk.
-- На каждом сигнале в freeze делаем sync с биржей: если позиция уже есть -> НЕ открываем новую (нет спама LIVE_MAX_POSITIONS),
+- На каждом сигнале в freeze делаем sync с биржей: если позиция уже есть -> НЕ открываем новую,
   а подхватываем watcher. Если позиции нет -> можем открыть.
+- Ошибки в обработке тиков НЕ роняют WS-соединение (нет reconnect-спама).
 
 Требования:
 - Python 3.10+
@@ -39,6 +40,8 @@ import time
 import json
 import asyncio
 import signal
+import hmac
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, Deque, Optional, Tuple, List
 from collections import deque
@@ -165,7 +168,7 @@ class Config:
     LIVE_NOTIONAL_USD: float = 5.0
     LIVE_LEVERAGE: int = 2
     LIVE_MAX_POSITIONS: int = 1
-    MAX_DEVIATION_PCT: float = 0.20
+    MAX_DEVIATION_PCT: float = 0.50
 
     WATCH_POLL_SEC: float = 2.0
     WATCH_PROFIT_TIMEOUT_SEC: int = 6000
@@ -616,11 +619,6 @@ class LiveEngine:
         }
 
     async def sync_symbol(self, symbol: str) -> Optional[dict]:
-        """
-        Синхронизируем состояние по символу:
-        - если на бирже позиции нет -> удаляем из open_positions (если там была)
-        - если на бирже позиция есть, а у нас нет -> создаём запись (для watcher)
-        """
         ex = await self.get_exchange_position(symbol)
         if ex is None:
             if symbol in self.open_positions:
@@ -628,7 +626,6 @@ class LiveEngine:
                 self.open_positions.pop(symbol, None)
             return None
 
-        # позиция есть
         if symbol not in self.open_positions:
             self.open_positions[symbol] = {
                 "symbol": symbol,
@@ -640,24 +637,17 @@ class LiveEngine:
             }
             print(f"[LIVE] SYNC: found existing exchange position -> attach {symbol} side={ex['side']} qty={ex['qty']:.8f} entry={ex['entry']:.10f}")
         else:
-            # обновим qty/entry если поменялись
             self.open_positions[symbol]["side"] = ex["side"]
             self.open_positions[symbol]["qty"] = float(ex["qty"])
             if ex["entry"]:
                 self.open_positions[symbol]["entry"] = float(ex["entry"])
         return self.open_positions[symbol]
 
-    async def any_open_exchange(self, symbol: str) -> bool:
-        ex = await self.get_exchange_position(symbol)
-        return ex is not None
-
     async def open_live(self, symbol: str, side: str, last_price: float) -> dict:
-        # Перед входом синк: если уже есть позиция -> просто вернём её и НЕ открываем новую
         existing = await self.sync_symbol(symbol)
         if existing is not None:
             return existing
 
-        # Также защитимся от лимита: если вдруг у нас уже есть какая-то другая позиция в памяти
         if len(self.open_positions) >= self.cfg.LIVE_MAX_POSITIONS:
             raise RuntimeError(f"LIVE_MAX_POSITIONS reached: {self.cfg.LIVE_MAX_POSITIONS}")
 
@@ -681,7 +671,7 @@ class LiveEngine:
         res = await self.api.place_order(symbol, order_side, qty_req, reduce_only=False)
         order_id = res.get("orderId", "")
 
-        # ждём позицию в positionRisk
+        # confirm via positionRisk
         t0 = time.time()
         qty = 0.0
         entry = 0.0
@@ -690,9 +680,7 @@ class LiveEngine:
             if ex is not None and ex["qty"] > 0:
                 qty = float(ex["qty"])
                 entry = float(ex["entry"] or last_price)
-                side_real = ex["side"]
-                # если биржа вернула сторону не ту, что ожидали — используем биржу
-                side = side_real
+                side = ex["side"]
                 break
             await asyncio.sleep(0.25)
 
@@ -720,7 +708,6 @@ class LiveEngine:
     async def close_live_market(self, symbol: str, exit_price: float, reason: str) -> dict:
         pos = self.open_positions.get(symbol)
         if not pos:
-            # возможно состояние потеряно — попробуем синк
             await self.sync_symbol(symbol)
             pos = self.open_positions.get(symbol)
             if not pos:
@@ -729,11 +716,9 @@ class LiveEngine:
         side = pos["side"]
         close_side = "SELL" if side == "LONG" else "BUY"
 
-        # qty берём с биржи (самое надёжное)
         ex = await self.get_exchange_position(symbol)
         qty = float(ex["qty"]) if ex is not None else float(pos.get("qty", 0.0) or 0.0)
         if qty <= 0:
-            # если на бирже уже закрыто — просто зафиксируем и удалим локально
             print(f"[LIVE] CLOSE: exchange qty=0 -> treat as already closed. Drop local {symbol}")
             self.open_positions.pop(symbol, None)
             return {"symbol": symbol, "pnl_pct": 0.0, "net_pnl_usd": 0.0, "outcome": "TIMEOUT", "reason": "ALREADY_CLOSED"}
@@ -779,9 +764,6 @@ class LiveEngine:
         return {"symbol": symbol, "pnl_pct": pnl_pct, "net_pnl_usd": net, "outcome": outcome, "reason": reason}
 
     async def watch_until_close(self, symbol: str, tick_price_getter, stop_event: asyncio.Event):
-        """
-        WATCH берёт side/entry из self.open_positions (которые синхронизированы с биржей).
-        """
         pos = self.open_positions.get(symbol)
         if not pos:
             await self.sync_symbol(symbol)
@@ -792,13 +774,11 @@ class LiveEngine:
         side = pos["side"]
         entry = float(pos.get("entry", 0.0) or 0.0)
         if entry <= 0:
-            # попробуем подтянуть с биржи
             ex = await self.get_exchange_position(symbol)
             if ex is not None and ex.get("entry"):
                 entry = float(ex["entry"])
                 pos["entry"] = entry
         if entry <= 0:
-            # fallback на текущую цену
             px0 = tick_price_getter(symbol) or 0.0
             entry = float(px0 or 1.0)
             pos["entry"] = entry
@@ -813,7 +793,6 @@ class LiveEngine:
         while not stop_event.is_set():
             await asyncio.sleep(self.cfg.WATCH_POLL_SEC)
 
-            # если позиция закрылась на бирже (вручную/по ликвидации/и т.п.) — считаем что цикл завершён
             ex = await self.get_exchange_position(symbol)
             if ex is None:
                 print(f"[WATCH] {symbol}: exchange position is closed -> stop watcher")
@@ -972,11 +951,9 @@ class Orchestrator:
         return self._live_watch_task is not None and not self._live_watch_task.done()
 
     async def _start_or_resume_live_watch(self, symbol: str):
-        # Если уже есть watcher — ничего не делаем
         if self._live_watch_running():
             return
 
-        # Синхронизируем позицию
         pos = await self.live.sync_symbol(symbol)
         if pos is None:
             return
@@ -991,7 +968,6 @@ class Orchestrator:
             finally:
                 self._live_watch_symbol = None
                 self._live_watch_task = None
-                # После любой развязки live -> reset и возобновляем paper
                 self.paper.reset_all_streaks()
 
         self._live_watch_task = asyncio.create_task(_runner())
@@ -1002,49 +978,39 @@ class Orchestrator:
         if symbol in self.indicators:
             self.indicators[symbol].update_trade(ts_ms, price)
 
-        # PAPER close
         self.paper.maybe_close_on_price(symbol, price)
 
-        # Если идёт live watcher — просто продолжаем (reset будет в watcher)
         if self._live_watch_running():
             return
 
-        # signal
         atr_pct = self._get_atr_pct(symbol, price)
         spread_pct = self._get_spread_pct(symbol)
         sig = self.signals.signal_side(symbol, atr_pct, spread_pct)
         if not sig:
             return
 
-        # NORMAL: open paper
         if not self.paper.freeze_paper_entries:
             if self.cfg.PAPER_ENABLED and self.paper._can_open(symbol):
                 self.paper.open(symbol, sig, price)
             return
 
-        # FROZEN: работаем только по trigger_symbol
         trig = self.paper.trigger_symbol
         if not trig or symbol != trig:
             return
-
-        # Требуем отсутствие paper позиции по trigger
         if symbol in self.paper.positions:
             return
 
-        # Перед любыми действиями: если на бирже уже есть позиция по trigger — подхватываем watcher и НЕ открываем новую
         if self.cfg.LIVE_ENABLED:
             ex_pos = await self.live.sync_symbol(symbol)
             if ex_pos is not None:
                 await self._start_or_resume_live_watch(symbol)
                 return
 
-        # Если live выключен — просто reset
         if not self.cfg.LIVE_ENABLED:
             print("[LIVE] Skipped: LIVE_ENABLED=false. Still resetting.")
             self.paper.reset_all_streaks()
             return
 
-        # deviation guard
         try:
             bid, ask = await self.api.book_ticker(symbol)
             mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else price
@@ -1055,14 +1021,12 @@ class Orchestrator:
         except Exception:
             pass
 
-        # OPEN live (если уже открылось — вернёт существующую позицию)
         try:
             await self.live.open_live(symbol, sig, price)
         except Exception as e:
             print(f"[LIVE] ERROR: cannot open live: {e}")
             return
 
-        # стартуем watcher
         await self._start_or_resume_live_watch(symbol)
 
     async def ws_loop(self):
@@ -1087,7 +1051,12 @@ class Orchestrator:
                         async for msg in ws:
                             if self.stop_event.is_set():
                                 break
-                            await self._on_ws_message(msg)
+                            # ВАЖНО: не даём ошибке в обработке тика завалить WS-loop
+                            try:
+                                await self._on_ws_message(msg)
+                            except Exception as e:
+                                print(f"[WS] MSG-HANDLER ERROR: {e}")
+
                 else:
                     base = self.cfg.WS_BASE.rstrip("/")
                     ws_url = base if base.endswith("/ws") else f"{base}/ws"
@@ -1099,7 +1068,10 @@ class Orchestrator:
                         async for msg in ws:
                             if self.stop_event.is_set():
                                 break
-                            await self._on_ws_message(msg)
+                            try:
+                                await self._on_ws_message(msg)
+                            except Exception as e:
+                                print(f"[WS] MSG-HANDLER ERROR: {e}")
 
             except Exception as e:
                 print(f"[WS] ERROR: {e}. Reconnecting in 3s...")
