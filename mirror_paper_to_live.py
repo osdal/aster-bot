@@ -43,8 +43,8 @@ import json
 import hmac
 import hashlib
 import asyncio
-import random
 import signal
+import random
 from dataclasses import dataclass
 from typing import Dict, Deque, Optional, Tuple, List
 from collections import deque
@@ -157,6 +157,12 @@ class Config:
 
     WATCH_POLL_SEC: float = 2.0
     WATCH_PROFIT_TIMEOUT_SEC: int = 6000
+
+    # health / watchdogs
+    HEARTBEAT_MIN_SEC: int = 30
+    HEARTBEAT_MAX_SEC: int = 60
+    WS_STALE_SEC: int = 180
+    PAPER_TIMEOUT_POLL_SEC: float = 5.0
     WATCH_HARD_TIMEOUT_SEC: int = 12000
 
     LIVE_CLOSE_RETRIES: int = 6
@@ -167,15 +173,6 @@ class Config:
     ASTER_API_SECRET: str = ""
 
     DEBUG: bool = False
-
-
-    # health/monitoring
-    HEARTBEAT_MIN_SEC: int = 30
-    HEARTBEAT_MAX_SEC: int = 60
-    WS_STALE_SEC: int = 45
-    WS_WATCHDOG_CHECK_SEC: int = 5
-    PAPER_TIMEOUT_CHECK_SEC: int = 5
-    PAPER_TIMEOUT_USE_REST: bool = True
 
     @staticmethod
     def load() -> "Config":
@@ -230,6 +227,11 @@ class Config:
         cfg.WATCH_POLL_SEC = _env_float("WATCH_POLL_SEC", cfg.WATCH_POLL_SEC)
         cfg.WATCH_PROFIT_TIMEOUT_SEC = _env_int("WATCH_PROFIT_TIMEOUT_SEC", cfg.WATCH_PROFIT_TIMEOUT_SEC)
         cfg.WATCH_HARD_TIMEOUT_SEC = _env_int("WATCH_HARD_TIMEOUT_SEC", cfg.WATCH_HARD_TIMEOUT_SEC)
+
+        cfg.HEARTBEAT_MIN_SEC = _env_int("HEARTBEAT_MIN_SEC", cfg.HEARTBEAT_MIN_SEC)
+        cfg.HEARTBEAT_MAX_SEC = _env_int("HEARTBEAT_MAX_SEC", cfg.HEARTBEAT_MAX_SEC)
+        cfg.WS_STALE_SEC = _env_int("WS_STALE_SEC", cfg.WS_STALE_SEC)
+        cfg.PAPER_TIMEOUT_POLL_SEC = _env_float("PAPER_TIMEOUT_POLL_SEC", cfg.PAPER_TIMEOUT_POLL_SEC)
 
         cfg.LIVE_CLOSE_RETRIES = _env_int("LIVE_CLOSE_RETRIES", cfg.LIVE_CLOSE_RETRIES)
         cfg.LIVE_CLOSE_RETRY_SLEEP_SEC = _env_float("LIVE_CLOSE_RETRY_SLEEP_SEC", cfg.LIVE_CLOSE_RETRY_SLEEP_SEC)
@@ -736,11 +738,10 @@ class Orchestrator:
         self.last_price: Dict[str, float] = {}
         self.spread_cache: Dict[str, float] = {}
         self.live=LiveEngine(cfg, self.api)
-        self.stop_event = asyncio.Event()
-        self.paper_lock = asyncio.Lock()
-        self.last_ws_msg_ts: float = time.time()
-        self.last_tick_ts: float = time.time()
-        self._ws_reconnect_event = asyncio.Event()
+        self.stop_event=asyncio.Event()
+        self.ws_reconnect_requested = asyncio.Event()
+        self.last_ws_msg_ts: float = 0.0
+        self.last_tick_ts: float = 0.0
 
         self.active_symbols: List[str] = []
         self._ws_task=None; self._universe_task=None; self._spread_task=None
@@ -869,10 +870,8 @@ class Orchestrator:
             return
 
         if not self.paper.freeze_paper_entries:
-            if self.cfg.PAPER_ENABLED:
-                async with self.paper_lock:
-                    if self.paper._can_open(symbol):
-                        self.paper.open(symbol, sig, price)
+            if self.cfg.PAPER_ENABLED and self.paper._can_open(symbol):
+                self.paper.open(symbol, sig, price)
             return
 
         trig=self.paper.trigger_symbol
@@ -886,85 +885,84 @@ class Orchestrator:
         except Exception:
             return
 
-        async with self.paper_lock:
-            if symbol in self.paper.positions:
-                return
+        if symbol in self.paper.positions:
+            return
 
         await self._maybe_open_live_on_signal(symbol, sig, price)
 
 
-    async def heartbeat_loop(self):
-        # Heartbeat every 30–60s (configurable) prints last_tick_age and mode.
-        while not self.stop_event.is_set():
-            a = int(self.cfg.HEARTBEAT_MIN_SEC)
-            b = int(self.cfg.HEARTBEAT_MAX_SEC)
-            sleep_s = random.randint(a, b) if b > a else a
-            await asyncio.sleep(max(1, sleep_s))
+async def heartbeat_loop(self):
+    while not self.stop_event.is_set():
+        await asyncio.sleep(random.uniform(self.cfg.HEARTBEAT_MIN_SEC, self.cfg.HEARTBEAT_MAX_SEC))
+        now = time.time()
+        last_tick_age = now - self.last_tick_ts if self.last_tick_ts > 0 else float("inf")
+        last_ws_age = now - self.last_ws_msg_ts if self.last_ws_msg_ts > 0 else float("inf")
+        mode = "FROZEN" if self.paper.freeze_paper_entries else "NORMAL"
+        trig = self.paper.trigger_symbol or "-"
+        paper_open = len(self.paper.positions)
+        live_open = len(self.live.open_positions)
+        print(f"[HEARTBEAT] mode={mode} trigger={trig} last_tick_age={last_tick_age:.1f}s last_ws_age={last_ws_age:.1f}s paper_open={paper_open} live_open={live_open}")
 
-            now = time.time()
-            last_tick_age = now - (self.last_tick_ts or now)
-            last_ws_age = now - (self.last_ws_msg_ts or now)
-            mode = "FROZEN" if self.paper.freeze_paper_entries else "NORMAL"
-            trig = self.paper.trigger_symbol or "-"
-            opens = len(self.paper.positions)
-            live_opens = len(self.live.open_positions)
-            print(f"[HEARTBEAT] mode={mode} trigger={trig} paper_open={opens} live_open={live_opens} last_tick_age={last_tick_age:.1f}s last_ws_msg_age={last_ws_age:.1f}s")
+async def ws_watchdog_loop(self):
+    """WS watchdog: if no frames arrive for WS_STALE_SEC, force reconnect."""
+    stale_hits = 0
+    while not self.stop_event.is_set():
+        await asyncio.sleep(1.0)
 
-    async def ws_watchdog_loop(self):
-        # If no WS JSON messages for WS_STALE_SEC -> force WS reconnect.
-        while not self.stop_event.is_set():
-            await asyncio.sleep(max(1, int(self.cfg.WS_WATCHDOG_CHECK_SEC)))
-            now = time.time()
-            age = now - (self.last_ws_msg_ts or now)
-            if age > float(self.cfg.WS_STALE_SEC):
-                if not self._ws_reconnect_event.is_set():
-                    print(f"[WS-WD] stale ws stream: last_ws_msg_age={age:.1f}s > WS_STALE_SEC={self.cfg.WS_STALE_SEC}. Forcing reconnect...")
-                    self._ws_reconnect_event.set()
+        # if reconnect already requested, don't spam
+        if self.ws_reconnect_requested.is_set():
+            stale_hits = 0
+            continue
 
-    async def paper_timeout_loop(self):
-        # Closes PAPER positions by time even if no ticks. Uses REST price when possible.
-        check_s = max(1, int(self.cfg.PAPER_TIMEOUT_CHECK_SEC))
-        while not self.stop_event.is_set():
-            await asyncio.sleep(check_s)
-            if not self.cfg.PAPER_ENABLED:
+        age = time.time() - self.last_ws_msg_ts if self.last_ws_msg_ts > 0 else 1e9
+        if age > self.cfg.WS_STALE_SEC:
+            stale_hits += 1
+            if stale_hits >= 2:
+                print(f"[WS-WD] stale ws stream: last_ws_msg_age={age:.1f}s > WS_STALE_SEC={self.cfg.WS_STALE_SEC}. Forcing reconnect...")
+                self.ws_reconnect_requested.set()
+                stale_hits = 0
+        else:
+            stale_hits = 0
+
+async def paper_timeout_loop(self):
+    """Close PAPER positions by time even if there are no ticks. Uses REST bookTicker mid as price fallback."""
+    while not self.stop_event.is_set():
+        await asyncio.sleep(self.cfg.PAPER_TIMEOUT_POLL_SEC)
+
+        if not self.cfg.PAPER_ENABLED:
+            continue
+        if self.cfg.MAX_HOLDING_SEC <= 0:
+            continue
+
+        now = time.time()
+        symbols = list(self.paper.positions.keys())
+        for sym in symbols:
+            pos = self.paper.positions.get(sym)
+            if not pos:
                 continue
-            if self.cfg.MAX_HOLDING_SEC <= 0:
+            if (now - pos.opened_ts) < self.cfg.MAX_HOLDING_SEC:
                 continue
 
-            # snapshot positions to evaluate without holding lock for REST calls
-            async with self.paper_lock:
-                positions = list(self.paper.positions.values())
+            px = self.last_price.get(sym)
+            if not px or px <= 0:
+                try:
+                    bid, ask = await self.api.book_ticker(sym)
+                    if bid > 0 and ask > 0:
+                        px = (bid + ask) / 2.0
+                except Exception:
+                    px = pos.entry
 
-            if not positions:
-                continue
-
-            now = time.time()
-            for pos in positions:
-                if (now - pos.opened_ts) < self.cfg.MAX_HOLDING_SEC:
-                    continue
-
-                # choose price: REST or last tick
-                exit_px = None
-                if self.cfg.PAPER_TIMEOUT_USE_REST:
-                    try:
-                        px = await self.api.ticker_price(pos.symbol)
-                        if px and px > 0:
-                            exit_px = px
-                    except Exception:
-                        exit_px = None
-                if exit_px is None:
-                    exit_px = self.last_price.get(pos.symbol) or pos.entry
-
-                async with self.paper_lock:
-                    # may have been closed by tick while we awaited REST
-                    if pos.symbol in self.paper.positions:
-                        self.paper.close(pos.symbol, float(exit_px), "TIMEOUT")
+            try:
+                self.paper.close(sym, float(px), "TIMEOUT")
+            except Exception as e:
+                print(f"[PAPER-TIMEOUT] ERROR closing {sym}: {e}")
 
     async def ws_loop(self):
         """
-        WS reader with watchdog-triggered reconnect.
-        - Uses recv() with timeout so we can exit even if market is quiet.
-        - If _ws_reconnect_event is set -> break the current connection and reopen.
+        WS loop with two modes:
+        - COMBINED: /stream?streams=...
+        - SUBSCRIBE: /ws with SUBSCRIBE message
+        Also supports watchdog-triggered reconnect via ws_reconnect_requested.
         """
         while not self.stop_event.is_set():
             syms = list(self.active_symbols)
@@ -977,6 +975,8 @@ class Orchestrator:
             if mode == "AUTO":
                 mode = "SUBSCRIBE" if self.cfg.WS_BASE.rstrip("/").endswith("/ws") else "COMBINED"
 
+            self.ws_reconnect_requested.clear()
+
             try:
                 if mode == "COMBINED":
                     stream_q = "/".join(streams)
@@ -985,21 +985,22 @@ class Orchestrator:
                     async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
                         print("[WS] connected.")
                         self.last_ws_msg_ts = time.time()
-                        self._ws_reconnect_event.clear()
-
                         while not self.stop_event.is_set():
-                            if self._ws_reconnect_event.is_set():
+                            if self.ws_reconnect_requested.is_set():
+                                print("[WS] reconnect requested -> reconnecting in 1s...")
                                 break
                             try:
                                 msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             except asyncio.TimeoutError:
                                 continue
-                            if msg is None:
+                            except Exception:
                                 break
+                            if msg is None:
+                                continue
+                            self.last_ws_msg_ts = time.time()
                             await self._on_ws_message(msg)
 
                 else:
-                    # SUBSCRIBE
                     base = self.cfg.WS_BASE.rstrip("/")
                     ws_url = base if base.endswith("/ws") else f"{base}/ws"
                     print(f"[WS] connecting (SUBSCRIBE): {ws_url}")
@@ -1008,28 +1009,30 @@ class Orchestrator:
                         await ws.send(json.dumps(sub))
                         print(f"[WS] connected. SUBSCRIBE {len(streams)} streams")
                         self.last_ws_msg_ts = time.time()
-                        self._ws_reconnect_event.clear()
-
                         while not self.stop_event.is_set():
-                            if self._ws_reconnect_event.is_set():
+                            if self.ws_reconnect_requested.is_set():
+                                print("[WS] reconnect requested -> reconnecting in 1s...")
                                 break
                             try:
                                 msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             except asyncio.TimeoutError:
                                 continue
-                            if msg is None:
+                            except Exception:
                                 break
+                            if msg is None:
+                                continue
+                            self.last_ws_msg_ts = time.time()
                             await self._on_ws_message(msg)
+
+                # if we broke because reconnect requested
+                if self.ws_reconnect_requested.is_set():
+                    await asyncio.sleep(1)
+                    continue
 
             except Exception as e:
                 print(f"[WS] ERROR: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
 
-            # reconnect requested
-            if self._ws_reconnect_event.is_set():
-                self._ws_reconnect_event.clear()
-                print("[WS] reconnect requested -> reconnecting in 1s...")
-                await asyncio.sleep(1)
     async def _on_ws_message(self, msg: str):
         try:
             data=json.loads(msg)
@@ -1053,6 +1056,7 @@ class Orchestrator:
             ts_ms=int(payload.get("T") or payload.get("tradeTime") or payload.get("E") or _now_ms())
         except Exception:
             ts_ms=_now_ms()
+        self.last_tick_ts = time.time()
         await self._handle_trade_tick(sym, price, ts_ms)
 
     async def run(self):
@@ -1076,10 +1080,10 @@ class Orchestrator:
 
         self._universe_task=asyncio.create_task(self.universe_loop())
         self._spread_task=asyncio.create_task(self.spread_loop())
-        self._ws_task = asyncio.create_task(self.ws_loop())
-        self._heartbeat_task = asyncio.create_task(self.heartbeat_loop())
-        self._ws_watchdog_task = asyncio.create_task(self.ws_watchdog_loop())
-        self._paper_timeout_task = asyncio.create_task(self.paper_timeout_loop())
+        self._ws_task=asyncio.create_task(self.ws_loop())
+        self._heartbeat_task=asyncio.create_task(self.heartbeat_loop())
+        self._ws_watchdog_task=asyncio.create_task(self.ws_watchdog_loop())
+        self._paper_timeout_task=asyncio.create_task(self.paper_timeout_loop())
         await self.stop_event.wait()
         for t in [self._ws_task, self._spread_task, self._universe_task, self._heartbeat_task, self._ws_watchdog_task, self._paper_timeout_task]:
             if t: t.cancel()
