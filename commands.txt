@@ -1,0 +1,32 @@
+1. Перейти в папку проекта
+    cd C:\bots\aster-perps-bot\aster-bot
+
+2. Создать venv (если ещё нет)
+    python -m venv .venv
+
+3. Активировать venv
+    .\.venv\Scripts\Activate.ps1
+
+4. Проверка, что активировалось (должно показать путь внутри .venv)
+    python -c "import sys; print(sys.executable)"
+
+5. Если PowerShell ругается на запуск скриптов (ExecutionPolicy
+    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+6. Потом снова
+    .\.venv\Scripts\Activate.ps1
+
+7. Установить зависимости
+    python -m pip install -r requirements.txt
+
+8. Заполнить ключи (если LIVE_ENABLED=true)
+    ASTER_API_KEY=твои_ключи
+    ASTER_API_SECRET=твой_секрет
+    LIVE_ENABLED=true
+    PAPER_ENABLED=true
+
+9. Опционально — если хочешь отключить live на время теста
+    LIVE_ENABLED=false
+
+10. Запуск
+    python -u .\mirror_paper_to_live.py
