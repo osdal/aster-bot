@@ -1068,6 +1068,7 @@ async def paper_timeout_loop(self):
         print("[MIRROR] PAPER_LOG_PATH=", self.cfg.PAPER_LOG_PATH)
         print("[MIRROR] LIVE_LOG_PATH =", self.cfg.LIVE_LOG_PATH)
         print("[MIRROR] MAX_DEVIATION_PCT=", self.cfg.MAX_DEVIATION_PCT)
+        print("[MIRROR] HEARTBEAT_SEC=", self.cfg.HEARTBEAT_SEC, "WS_STALE_SEC=", self.cfg.WS_STALE_SEC, "WS_STALE_HITS=", self.cfg.WS_STALE_HITS)
         if self.cfg.LIVE_ENABLED and (not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET):
             raise RuntimeError("LIVE_ENABLED=true but ASTER_API_KEY/ASTER_API_SECRET are missing in environment.")
 
