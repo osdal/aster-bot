@@ -861,6 +861,7 @@ class Orchestrator:
         self.stop_event = asyncio.Event()
         self.ws_reconnect_requested = asyncio.Event()
 
+        self._ws = None  # current websocket (for forced close)
         self.last_ws_msg_ts = time.time()
         self.last_tick_ts = time.time()
 
@@ -1060,27 +1061,20 @@ class Orchestrator:
                     ws_url = f"{self.cfg.WS_BASE.rstrip('/')}/stream?streams={stream_q}"
                     print(f"[WS] connecting (COMBINED): {ws_url}")
                     async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                        self._ws = ws
                         print("[WS] connected.")
                         self.last_ws_msg_ts = time.time()
-                        async for msg in ws:
-                            if self.stop_event.is_set() or self.ws_reconnect_requested.is_set():
-                                break
+                        # Receive with timeout so watchdog/reconnect flag can be handled even when the stream is silent/stalled
+                        while not self.stop_event.is_set() and not self.ws_reconnect_requested.is_set():
+                            try:
+                                msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            except asyncio.TimeoutError:
+                                continue
+                            except websockets.exceptions.ConnectionClosed:
+                                raise
+                            self.last_ws_msg_ts = time.time()
                             await self._on_ws_message(msg)
-
-                else:
-                    base = self.cfg.WS_BASE.rstrip("/")
-                    ws_url = base if base.endswith("/ws") else f"{base}/ws"
-                    print(f"[WS] connecting (SUBSCRIBE): {ws_url}")
-                    async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
-                        sub = {"method": "SUBSCRIBE", "params": streams, "id": 1}
-                        await ws.send(json.dumps(sub))
-                        print(f"[WS] connected. SUBSCRIBE {len(streams)} streams")
-                        self.last_ws_msg_ts = time.time()
-                        async for msg in ws:
-                            if self.stop_event.is_set() or self.ws_reconnect_requested.is_set():
-                                break
-                            await self._on_ws_message(msg)
-
+                        self._ws = None
             except Exception as e:
                 print(f"[WS] ERROR: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
@@ -1150,6 +1144,12 @@ class Orchestrator:
                 if stale_hits >= self.cfg.WS_STALE_HITS_TO_RECONNECT:
                     print(f"[WS-WD] stale ws stream: last_ws_msg_age={age:.1f}s > WS_STALE_SEC={self.cfg.WS_STALE_SEC}. Forcing reconnect...")
                     self.ws_reconnect_requested.set()
+            # If WS receive loop is blocked waiting for a frame, close the socket to unblock it
+            if self._ws is not None:
+                try:
+                    asyncio.create_task(self._ws.close(code=4000, reason="stale"))
+                except Exception:
+                    pass
                     stale_hits = 0
             else:
                 stale_hits = 0
