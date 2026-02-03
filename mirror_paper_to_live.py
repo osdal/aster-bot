@@ -1062,6 +1062,7 @@ class Orchestrator:
                     print(f"[WS] connecting (COMBINED): {ws_url}")
                     async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
                         self._ws = ws
+                        self._ws_close_sent = False
                         print("[WS] connected.")
                         self.last_ws_msg_ts = time.time()
                         # Receive with timeout so watchdog/reconnect flag can be handled even when the stream is silent/stalled
@@ -1075,6 +1076,7 @@ class Orchestrator:
                             self.last_ws_msg_ts = time.time()
                             await self._on_ws_message(msg)
                         self._ws = None
+                        self._ws_close_sent = False
             except Exception as e:
                 print(f"[WS] ERROR: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
@@ -1132,27 +1134,41 @@ class Orchestrator:
             print(f"[HEARTBEAT] mode={mode} trigger={trig} last_tick_age={last_tick_age:.1f}s paper_open={paper_open} live_open={live_open}")
 
     async def ws_watchdog_loop(self):
+        """Monitor WS silence and request reconnect when it's truly stale.
+
+        IMPORTANT: do NOT close the socket on every loop iteration.
+        Only close it after we've decided to reconnect, otherwise we self-trigger
+        'sent 4000 (private use) stale' in a tight loop.
+        """
         stale_hits = 0
+
         while not self.stop_event.is_set():
             await asyncio.sleep(1.0)
-            if self.ws_reconnect_requested.is_set():
+
+            age = time.time() - self.last_ws_msg_ts
+
+            if age <= self.cfg.WS_STALE_SEC:
                 stale_hits = 0
                 continue
-            age = time.time() - self.last_ws_msg_ts
-            if age > self.cfg.WS_STALE_SEC:
-                stale_hits += 1
-                if stale_hits >= self.cfg.WS_STALE_HITS_TO_RECONNECT:
-                    print(f"[WS-WD] stale ws stream: last_ws_msg_age={age:.1f}s > WS_STALE_SEC={self.cfg.WS_STALE_SEC}. Forcing reconnect...")
-                    self.ws_reconnect_requested.set()
-            # If WS receive loop is blocked waiting for a frame, close the socket to unblock it
-            if self._ws is not None:
+
+            stale_hits += 1
+            if stale_hits < self.cfg.WS_STALE_HITS_TO_RECONNECT:
+                continue
+
+            if not self.ws_reconnect_requested.is_set():
+                print(
+                    f"[WS-WD] stale ws stream: last_ws_msg_age={age:.1f}s > WS_STALE_SEC={self.cfg.WS_STALE_SEC}. Forcing reconnect..."
+                )
+                self.ws_reconnect_requested.set()
+
+            ws = getattr(self, "_ws", None)
+            if ws is not None and not getattr(self, "_ws_close_sent", False):
+                self._ws_close_sent = True
                 try:
-                    asyncio.create_task(self._ws.close(code=4000, reason="stale"))
+                    asyncio.create_task(ws.close(code=4000, reason="stale"))
                 except Exception:
                     pass
-                    stale_hits = 0
-            else:
-                stale_hits = 0
+
 
     async def paper_timeout_loop(self):
         # closes paper positions by time even if no ticks
