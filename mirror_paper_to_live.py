@@ -173,6 +173,8 @@ class Config:
     WATCH_POLL_SEC: float = 2.0
     WATCH_PROFIT_TIMEOUT_SEC: int = 6000
     WATCH_HARD_TIMEOUT_SEC: int = 12000
+    EMERGENCY_CLOSE_ON_HARD_TIMEOUT: bool = False  # if True: market-close if still open after WATCH_HARD_TIMEOUT_SEC
+
 
     # heartbeat / watchdog
     HEARTBEAT_MIN_SEC: int = 30
@@ -355,7 +357,44 @@ class AsterFapi:
             params["reduceOnly"] = "true"
         return await self._signed("POST", "/fapi/v1/order", params)
 
-    async def position_risk(self, symbol: str):
+    
+    async def cancel_all_open_orders(self, symbol: str):
+        return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+
+    async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
+                                         working_type: str = "MARK_PRICE", price_protect: bool = True):
+        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true (Close-All)."""
+        params = {
+            "symbol": symbol,
+            "side": side,              # BUY/SELL
+            "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
+            "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
+            "closePosition": "true",
+            "workingType": working_type,
+        }
+        if price_protect:
+            params["priceProtect"] = "TRUE"
+        return await self._signed("POST", "/fapi/v1/order", params)
+
+    async def user_trades(self, symbol: str, start_time_ms: int | None = None,
+                          end_time_ms: int | None = None, limit: int = 200):
+        params = {"symbol": symbol, "limit": int(limit)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        return await self._signed("GET", "/fapi/v1/userTrades", params)
+
+    async def all_orders(self, symbol: str, start_time_ms: int | None = None,
+                         end_time_ms: int | None = None, limit: int = 200):
+        params = {"symbol": symbol, "limit": int(limit)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        return await self._signed("GET", "/fapi/v1/allOrders", params)
+
+async def position_risk(self, symbol: str):
         try:
             return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         except Exception:
@@ -723,6 +762,54 @@ class LiveEngine:
         else:
             raise RuntimeError("Order sent but position not found on exchange (positionAmt=0).")
 
+
+        # --- Place exchange-side SL/TP (Close-All) right after entry ---
+        entry_px = float((pos or {}).get("entry") or self.open_positions[symbol].get("entry") or last_price)
+        if entry_px <= 0:
+            entry_px = last_price
+
+        tp_px = entry_px * (1 + self.cfg.TP_PCT / 100.0) if side == "LONG" else entry_px * (1 - self.cfg.TP_PCT / 100.0)
+        sl_px = entry_px * (1 - self.cfg.SL_PCT / 100.0) if side == "LONG" else entry_px * (1 + self.cfg.SL_PCT / 100.0)
+
+        # round stop prices to tickSize to avoid rejection
+        f2 = self.api.get_symbol_filters(symbol)
+        tick = float(f2.get("tickSize", 0.0) or 0.0)
+        if tick > 0:
+            tp_px = _round_tick(tp_px, tick)
+            sl_px = _round_tick(sl_px, tick)
+
+        # clean any stale orders from previous runs
+        try:
+            await self.api.cancel_all_open_orders(symbol)
+        except Exception as e:
+            print(f"[LIVE] WARN: cancel_all_open_orders failed: {e}")
+
+        close_side = "SELL" if side == "LONG" else "BUY"
+
+        tp_res = await self.api.place_conditional_close_all(
+            symbol=symbol,
+            side=close_side,
+            order_type="TAKE_PROFIT_MARKET",
+            stop_price=tp_px,
+            working_type="MARK_PRICE",
+            price_protect=True,
+        )
+        sl_res = await self.api.place_conditional_close_all(
+            symbol=symbol,
+            side=close_side,
+            order_type="STOP_MARKET",
+            stop_price=sl_px,
+            working_type="MARK_PRICE",
+            price_protect=True,
+        )
+
+        self.open_positions[symbol]["tp_order_id"] = str(tp_res.get("orderId", ""))
+        self.open_positions[symbol]["sl_order_id"] = str(sl_res.get("orderId", ""))
+        self.open_positions[symbol]["tp_px"] = tp_px
+        self.open_positions[symbol]["sl_px"] = sl_px
+
+        print(f"[LIVE] SL/TP placed on-exchange {symbol}: TP={tp_px:.6g} SL={sl_px:.6g} tpOrder={self.open_positions[symbol]['tp_order_id']} slOrder={self.open_positions[symbol]['sl_order_id']}")
+
         return self.open_positions[symbol]
 
     @staticmethod
@@ -790,54 +877,112 @@ class LiveEngine:
         self.open_positions.pop(symbol, None)
         return {"symbol": symbol, "pnl_pct": pnl_pct, "net_pnl_usd": net, "outcome": outcome, "reason": reason}
 
-    async def watch_until_close(self, symbol: str, side: str, entry: float,
-                               tp_pct: float, sl_pct: float,
-                               tick_price_getter, rest_price_getter,
-                               stop_event: asyncio.Event):
-        tp = entry * (1 + tp_pct / 100.0) if side == "LONG" else entry * (1 - tp_pct / 100.0)
-        sl = entry * (1 - sl_pct / 100.0) if side == "LONG" else entry * (1 + sl_pct / 100.0)
+    async def watch_until_close(self, symbol: str, stop_event: asyncio.Event):
+        """Monitor only the FACT of position closure (no price-based TP/SL monitoring).
 
+        We rely on exchange-side STOP_MARKET + TAKE_PROFIT_MARKET created at entry (closePosition=true).
+        The loop exits when positionRisk shows positionAmt == 0.
+        """
         t0 = time.time()
-        profit_timeout_fired = False
-        print(f"[WATCH] {symbol}: watching... TP={tp:.6g} SL={sl:.6g} (profit-timeout={self.cfg.WATCH_PROFIT_TIMEOUT_SEC}s, hard-timeout={self.cfg.WATCH_HARD_TIMEOUT_SEC}s)")
+        open_meta = self.open_positions.get(symbol, {})
+        entry = float(open_meta.get("entry") or 0.0)
+        side = open_meta.get("side") or "LONG"
+        entry_order_id = str(open_meta.get("order_id_entry", ""))
+        tp_oid = str(open_meta.get("tp_order_id", ""))
+        sl_oid = str(open_meta.get("sl_order_id", ""))
+        opened_ts = float(open_meta.get("opened_ts") or t0)
+        opened_ms = int(opened_ts * 1000)
+
+        print(f"[WATCH] {symbol}: waiting for exchange to close the position... (tpOrder={tp_oid} slOrder={sl_oid})")
 
         while not stop_event.is_set():
             await asyncio.sleep(self.cfg.WATCH_POLL_SEC)
 
-            px = tick_price_getter(symbol)
-            if not px or px <= 0:
-                # fallback to rest to keep progressing even when ws is dead
-                try:
-                    px = await rest_price_getter(symbol)
-                except Exception:
-                    px = None
-
-            if not px or px <= 0:
-                continue
-
-            if side == "LONG":
-                if px >= tp:
-                    return await self.close_live_market(symbol, px, "TP")
-                if px <= sl:
-                    return await self.close_live_market(symbol, px, "SL")
-            else:
-                if px <= tp:
-                    return await self.close_live_market(symbol, px, "TP")
-                if px >= sl:
-                    return await self.close_live_market(symbol, px, "SL")
-
-            if (not profit_timeout_fired) and self.cfg.WATCH_PROFIT_TIMEOUT_SEC > 0 and (time.time() - t0) >= self.cfg.WATCH_PROFIT_TIMEOUT_SEC:
-                profit_timeout_fired = True
-                pnl_pct = self._pnl_pct(side, entry, px)
-                if pnl_pct > 0:
-                    return await self.close_live_market(symbol, px, "TIMEOUT_PROFIT")
+            pos = await self.reconcile_position(symbol)
+            if not pos:
+                # nothing on exchange -> treat as closed
+                break
+            if float(pos.get("qty") or 0.0) == 0.0:
+                break
 
             if self.cfg.WATCH_HARD_TIMEOUT_SEC > 0 and (time.time() - t0) >= self.cfg.WATCH_HARD_TIMEOUT_SEC:
-                return await self.close_live_market(symbol, px, "TIMEOUT_HARD")
+                if getattr(self.cfg, "EMERGENCY_CLOSE_ON_HARD_TIMEOUT", False):
+                    px = entry if entry > 0 else float(pos.get("mark_price") or entry or 0.0) or entry
+                    return await self.close_live_market(symbol, px, "TIMEOUT_HARD_EMERGENCY")
+                print(f"[WATCH] {symbol}: HARD TIMEOUT reached, but EMERGENCY_CLOSE_ON_HARD_TIMEOUT is False. Continuing to wait.")
+                t0 = time.time()  # avoid spam; restart timer
 
-        # forced stop
-        px = tick_price_getter(symbol) or entry
-        return await self.close_live_market(symbol, px, "FORCE_EXIT")
+        # closed (or forced stop): compute exit price and reason from userTrades
+        try:
+            now_ms = int(time.time() * 1000)
+            trades = await self.api.user_trades(symbol, start_time_ms=max(opened_ms - 10_000, 0), end_time_ms=now_ms, limit=200)
+        except Exception as e:
+            trades = []
+            print(f"[WATCH] {symbol}: WARN: userTrades failed: {e}")
+
+        # pick last trade after entry that is NOT the entry order (best effort)
+        exit_trade = None
+        if isinstance(trades, list) and trades:
+            trades_sorted = sorted(trades, key=lambda x: int(x.get("time") or x.get("T") or 0))
+            for tr in reversed(trades_sorted):
+                oid = str(tr.get("orderId", ""))
+                if entry_order_id and oid == entry_order_id:
+                    continue
+                exit_trade = tr
+                break
+
+        exit_px = None
+        realized = 0.0
+        reason = "CLOSE_UNKNOWN"
+        order_id_exit = ""
+
+        if exit_trade:
+            order_id_exit = str(exit_trade.get("orderId", ""))
+            exit_px = _csv_safe_float(exit_trade.get("price"))
+            realized = _csv_safe_float(exit_trade.get("realizedPnl") or exit_trade.get("realizedPnlValue") or exit_trade.get("realizedPnlUsd"))
+            if order_id_exit and tp_oid and order_id_exit == tp_oid:
+                reason = "TP_EXCHANGE"
+            elif order_id_exit and sl_oid and order_id_exit == sl_oid:
+                reason = "SL_EXCHANGE"
+
+        if exit_px is None or exit_px <= 0:
+            # fallback to last tick / entry
+            exit_px = entry if entry > 0 else 0.0
+
+        # ensure no leftover orders
+        try:
+            await self.api.cancel_all_open_orders(symbol)
+        except Exception:
+            pass
+
+        # if we couldn't get realized pnl, approximate by price diff (ignoring fees)
+        if realized == 0.0 and entry and exit_px:
+            pnl_pct = self._pnl_pct(side, entry, exit_px)
+            net = pnl_pct / 100.0 * float(open_meta.get("qty") or 0.0) * entry * float(self.cfg.LIVE_LEVERAGE)
+        else:
+            pnl_pct = self._pnl_pct(side, entry, exit_px) if entry and exit_px else 0.0
+            net = realized
+
+        outcome = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "FLAT")
+
+        # log + cleanup
+        self._append_live_csv(
+            ts=time.time(),
+            symbol=symbol,
+            side=side,
+            entry=entry,
+            exit_price=exit_px,
+            qty=float(open_meta.get("qty") or 0.0),
+            leverage=int(self.cfg.LIVE_LEVERAGE),
+            pnl_pct=pnl_pct,
+            net_pnl_usd=net,
+            outcome=outcome,
+            reason=reason,
+            order_id_entry=entry_order_id,
+            order_id_exit=order_id_exit,
+        )
+        self.open_positions.pop(symbol, None)
+        return {"symbol": symbol, "pnl_pct": pnl_pct, "net_pnl_usd": net, "outcome": outcome, "reason": reason}
 
 
 # =========================
@@ -1027,16 +1172,7 @@ class Orchestrator:
 
         # watch, then reset
         try:
-            await self.live.watch_until_close(
-                symbol=symbol,
-                side=pos["side"],
-                entry=float(pos.get("entry") or price),
-                tp_pct=self.cfg.TP_PCT,
-                sl_pct=self.cfg.SL_PCT,
-                tick_price_getter=self._tick_price_getter,
-                rest_price_getter=self._rest_price_getter,
-                stop_event=self.stop_event
-            )
+            await self.live.watch_until_close(symbol=symbol, stop_event=self.stop_event)
         except Exception as e:
             print(f"[LIVE] WATCHER ERROR: {e}")
         finally:
