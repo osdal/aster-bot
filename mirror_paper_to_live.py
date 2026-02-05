@@ -364,7 +364,7 @@ class AsterFapi:
                 "minNotional": min_notional,
             }
 
-def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
+    def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
         return self._symbol_filters.get(symbol, {"stepSize": 0.0, "minQty": 0.0, "minNotional": 0.0})
 
     async def book_ticker(self, symbol: str) -> Tuple[float, float]:
@@ -399,7 +399,7 @@ def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
             params["reduceOnly"] = "true"
         return await self._signed("POST", "/fapi/v1/order", params)
 
-async def cancel_all_open_orders(self, symbol: str):
+    async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
     async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
@@ -435,7 +435,7 @@ async def cancel_all_open_orders(self, symbol: str):
             params["endTime"] = int(end_time_ms)
         return await self._signed("GET", "/fapi/v1/allOrders", params)
 
-async def position_risk(self, symbol: str):
+    async def position_risk(self, symbol: str):
         try:
             return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         except Exception:
