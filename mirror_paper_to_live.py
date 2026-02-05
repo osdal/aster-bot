@@ -113,11 +113,18 @@ def _round_step(x: float, step: float) -> float:
         return x
     return math.floor(x / step) * step
 
-def _round_tick(x: float, tick: float) -> float:
-    """Round price to the nearest tickSize."""
-    if tick <= 0:
-        return x
-    return round(x / tick) * tick
+
+def _format_by_step(x: float, step: float) -> str:
+    """Format number with the exact number of decimals implied by step, stripping trailing zeros."""
+    if step <= 0:
+        # fallback: trim a reasonable amount
+        return f"{x:.10f}".rstrip("0").rstrip(".")
+    # decimals from step (e.g. 0.001 -> 3)
+    decimals = max(0, int(round(-math.log10(step))) ) if step < 1 else 0
+    return f"{x:.{decimals}f}".rstrip("0").rstrip(".")
+
+def _round_tick(price: float, tick: float) -> float:
+    return _round_step(price, tick) if tick and tick > 0 else price
 
 
 def _sign_hmac_sha256(secret: str, query_string: str) -> str:
@@ -312,31 +319,53 @@ class AsterFapi:
         return self._exchange_info
 
     def _parse_exchange_info(self, info: dict):
+        """Parse exchangeInfo filters.
+
+        We store:
+          - stepSize/minQty from LOT_SIZE (limit/stop quantity rules)
+          - marketStepSize/marketMinQty from MARKET_LOT_SIZE (market quantity rules)
+          - tickSize from PRICE_FILTER (price/stopPrice rounding)
+          - minNotional (if provided by NOTIONAL/MIN_NOTIONAL)
+        """
         self._symbol_filters.clear()
         for s in info.get("symbols", []):
             sym = s.get("symbol")
             if not sym:
                 continue
-            filters = {f["filterType"]: f for f in s.get("filters", []) if isinstance(f, dict) and "filterType" in f}
+            filters = {f.get("filterType"): f for f in s.get("filters", []) if isinstance(f, dict) and f.get("filterType")}
+
             step = 0.0
             min_qty = 0.0
+            m_step = 0.0
+            m_min_qty = 0.0
+            tick = 0.0
             min_notional = 0.0
+
             if "LOT_SIZE" in filters:
                 step = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
                 min_qty = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
+            if "MARKET_LOT_SIZE" in filters:
+                m_step = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("stepSize", 0))
+                m_min_qty = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("minQty", 0))
+            if "PRICE_FILTER" in filters:
+                tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
+
             if "MIN_NOTIONAL" in filters:
                 min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
             elif "NOTIONAL" in filters:
                 min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
+
             self._symbol_filters[sym] = {
                 "stepSize": step,
                 "minQty": min_qty,
+                "marketStepSize": m_step,
+                "marketMinQty": m_min_qty,
+                "tickSize": tick,
                 "minNotional": min_notional,
-                "tickSize": tick_size,
             }
 
-    def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
-        return self._symbol_filters.get(symbol, {"stepSize": 0.0, "minQty": 0.0, "minNotional": 0.0, "tickSize": 0.0})
+def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
+        return self._symbol_filters.get(symbol, {"stepSize": 0.0, "minQty": 0.0, "minNotional": 0.0})
 
     async def book_ticker(self, symbol: str) -> Tuple[float, float]:
         j = await self._public_get("/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
@@ -355,18 +384,22 @@ class AsterFapi:
         return await self._signed("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
 
     async def place_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False):
+        # Use MARKET_LOT_SIZE when available; Aster can reject MARKET orders if quantity doesn't match it.
+        f = self.get_symbol_filters(symbol)
+        step = float(f.get("marketStepSize") or f.get("stepSize") or 0.0)
+        if step > 0:
+            qty = _round_step(qty, step)
         params = {
             "symbol": symbol,
             "side": side,  # BUY/SELL
             "type": "MARKET",
-            "quantity": f"{qty:.10f}".rstrip("0").rstrip("."),
+            "quantity": _format_by_step(qty, step) if step > 0 else f"{qty:.10f}".rstrip("0").rstrip("."),
         }
         if reduce_only:
             params["reduceOnly"] = "true"
         return await self._signed("POST", "/fapi/v1/order", params)
 
-    
-    async def cancel_all_open_orders(self, symbol: str):
+async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
     async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
@@ -401,6 +434,12 @@ class AsterFapi:
         if end_time_ms is not None:
             params["endTime"] = int(end_time_ms)
         return await self._signed("GET", "/fapi/v1/allOrders", params)
+
+async def position_risk(self, symbol: str):
+        try:
+            return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        except Exception:
+            return await self._signed("GET", "/fapi/v1/positionRisk", {"symbol": symbol})
 
 
 # =========================
@@ -687,8 +726,7 @@ class LiveEngine:
         """Sync local open_positions with exchange positionRisk for symbol."""
         try:
             j = await self.api.position_risk(symbol)
-        except Exception as e:
-            print(f"[LIVE] WARN: positionRisk failed for {symbol}: {e}")
+        except Exception:
             return self.open_positions.get(symbol)
 
         pos = None
@@ -703,8 +741,13 @@ class LiveEngine:
         amt = _csv_safe_float(pos.get("positionAmt"))
         entry = _csv_safe_float(pos.get("entryPrice"))
         if abs(amt) < 1e-12:
-            # no position on exchange
+            # no position on exchange -> clear local + cancel any leftover closePosition/reduceOnly orders
             self.open_positions.pop(symbol, None)
+            try:
+                await self.api.cancel_all_open_orders(symbol)
+                print(f"[LIVE] CLEANUP {symbol}: canceled leftover open orders (no position on exchange).")
+            except Exception as e:
+                print(f"[LIVE] WARN: cleanup cancel_all_open_orders failed for {symbol}: {e}")
             return None
 
         side = "LONG" if amt > 0 else "SHORT"
@@ -732,8 +775,8 @@ class LiveEngine:
         qty = notional_effective / last_price
 
         f = self.api.get_symbol_filters(symbol)
-        step = float(f.get("stepSize", 0.0) or 0.0)
-        min_qty = float(f.get("minQty", 0.0) or 0.0)
+        step = float(f.get("marketStepSize") or f.get("stepSize") or 0.0)
+        min_qty = float(f.get("marketMinQty") or f.get("minQty") or 0.0)
 
         qty = _round_step(qty, step) if step > 0 else qty
         if qty < min_qty:
@@ -967,8 +1010,6 @@ class LiveEngine:
             net = realized
 
         outcome = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "FLAT")
-
-        print(f"[WATCH] {symbol}: CLOSED on exchange reason={reason} exit={exit_px:.6g} pnl_pct={pnl_pct:.3f}% net={net:.6g}")
 
         # log + cleanup
         self._append_live_csv(
