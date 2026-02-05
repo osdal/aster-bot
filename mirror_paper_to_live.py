@@ -113,6 +113,13 @@ def _round_step(x: float, step: float) -> float:
         return x
     return math.floor(x / step) * step
 
+
+def _round_tick(x: float, tick: float) -> float:
+    """Round DOWN to nearest tickSize."""
+    if tick <= 0:
+        return x
+    return math.floor(x / tick) * tick
+
 def _sign_hmac_sha256(secret: str, query_string: str) -> str:
     return hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -314,6 +321,9 @@ class AsterFapi:
             step = 0.0
             min_qty = 0.0
             min_notional = 0.0
+            tick = 0.0
+            if "PRICE_FILTER" in filters:
+                tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
             if "LOT_SIZE" in filters:
                 step = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
                 min_qty = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
@@ -325,6 +335,7 @@ class AsterFapi:
                 "stepSize": step,
                 "minQty": min_qty,
                 "minNotional": min_notional,
+                "tickSize": tick,
             }
 
     def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
@@ -362,18 +373,42 @@ class AsterFapi:
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
     async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
-                                         working_type: str = "MARK_PRICE", price_protect: bool = True):
-        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true (Close-All)."""
+                                         working_type: str | None = None, price_protect: bool | None = None):
+        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true (Close-All).
+        Note: Some venues reject extra params; keep them optional and only send when explicitly provided.
+        """
         params = {
             "symbol": symbol,
             "side": side,              # BUY/SELL
             "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
             "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
             "closePosition": "true",
-            "workingType": working_type,
         }
-        if price_protect:
+        if working_type:
+            params["workingType"] = working_type
+        if price_protect is True:
             params["priceProtect"] = "TRUE"
+        elif price_protect is False:
+            params["priceProtect"] = "FALSE"
+        return await self._signed("POST", "/fapi/v1/order", params)
+
+    async def place_conditional_reduce_only(self, symbol: str, side: str, order_type: str, stop_price: float, qty: float,
+                                           working_type: str | None = None, price_protect: bool | None = None):
+        """Fallback: place STOP_MARKET/TAKE_PROFIT_MARKET with quantity + reduceOnly=true (no closePosition)."""
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
+            "quantity": f"{qty:.10f}".rstrip("0").rstrip("."),
+            "reduceOnly": "true",
+        }
+        if working_type:
+            params["workingType"] = working_type
+        if price_protect is True:
+            params["priceProtect"] = "TRUE"
+        elif price_protect is False:
+            params["priceProtect"] = "FALSE"
         return await self._signed("POST", "/fapi/v1/order", params)
 
     async def user_trades(self, symbol: str, start_time_ms: int | None = None,
@@ -786,28 +821,65 @@ class LiveEngine:
 
         close_side = "SELL" if side == "LONG" else "BUY"
 
-        tp_res = await self.api.place_conditional_close_all(
-            symbol=symbol,
-            side=close_side,
-            order_type="TAKE_PROFIT_MARKET",
-            stop_price=tp_px,
-            working_type="MARK_PRICE",
-            price_protect=True,
-        )
-        sl_res = await self.api.place_conditional_close_all(
-            symbol=symbol,
-            side=close_side,
-            order_type="STOP_MARKET",
-            stop_price=sl_px,
-            working_type="MARK_PRICE",
-            price_protect=True,
-        )
+        # Place TP/SL. First try closePosition=true (minimal params). If venue rejects, fallback to reduceOnly+quantity.
+        try:
+            tp_res = await self.api.place_conditional_close_all(
+                symbol=symbol,
+                side=close_side,
+                order_type="TAKE_PROFIT_MARKET",
+                stop_price=tp_px,
+                working_type=None,
+                price_protect=None,
+            )
+            sl_res = await self.api.place_conditional_close_all(
+                symbol=symbol,
+                side=close_side,
+                order_type="STOP_MARKET",
+                stop_price=sl_px,
+                working_type=None,
+                price_protect=None,
+            )
+        except Exception as e1:
+            print(f"[LIVE] WARN: closePosition conditional rejected: {e1}")
+            qty_pos = float((pos or {}).get("qty") or self.open_positions[symbol].get("qty") or qty)
+            try:
+                tp_res = await self.api.place_conditional_reduce_only(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="TAKE_PROFIT_MARKET",
+                    stop_price=tp_px,
+                    qty=qty_pos,
+                    working_type=None,
+                    price_protect=None,
+                )
+                sl_res = await self.api.place_conditional_reduce_only(
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="STOP_MARKET",
+                    stop_price=sl_px,
+                    qty=qty_pos,
+                    working_type=None,
+                    price_protect=None,
+                )
+            except Exception as e2:
+                # If we cannot secure the position with exchange-side stops, close it immediately and surface the error.
+                print(f"[LIVE] ERROR: failed to place on-exchange SL/TP even with fallback: {e2}")
+                try:
+                    # Market-close reduceOnly to avoid leaving a naked position
+                    await self.api.place_order(symbol, close_side, qty_pos, reduce_only=True)
+                except Exception as e3:
+                    print(f"[LIVE] ERROR: emergency market-close failed: {e3}")
+                try:
+                    await self.api.cancel_all_open_orders(symbol)
+                except Exception:
+                    pass
+                self.open_positions.pop(symbol, None)
+                raise RuntimeError(f"Cannot place SL/TP on exchange for {symbol}. Aborted position.") from e2
 
         self.open_positions[symbol]["tp_order_id"] = str(tp_res.get("orderId", ""))
         self.open_positions[symbol]["sl_order_id"] = str(sl_res.get("orderId", ""))
         self.open_positions[symbol]["tp_px"] = tp_px
         self.open_positions[symbol]["sl_px"] = sl_px
-
         print(f"[LIVE] SL/TP placed on-exchange {symbol}: TP={tp_px:.6g} SL={sl_px:.6g} tpOrder={self.open_positions[symbol]['tp_order_id']} slOrder={self.open_positions[symbol]['sl_order_id']}")
 
         return self.open_positions[symbol]
