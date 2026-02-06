@@ -284,6 +284,30 @@ class AsterFapi:
         r.raise_for_status()
         return r.json()
 
+    async def _ensure_time_offset(self, force: bool = False):
+        """Sync local time with exchange server time.
+
+        AsterDex is Binance-futures-like; signed endpoints reject requests if `timestamp`
+        drifts beyond `recvWindow`. We keep a cached offset and refresh periodically.
+        """
+        now = time.time()
+        # refresh at most once per minute unless forced
+        if (not force) and self._time_offset_ts and (now - self._time_offset_ts) < 60:
+            return
+        try:
+            j = await self._public_get("/fapi/v1/time")
+            server_ms = j.get("serverTime") or j.get("server_time") or j.get("time") or j.get("ts")
+            server_ms = int(server_ms)
+            self._time_offset_ms = server_ms - _now_ms()
+            self._time_offset_ts = now
+            print(f"[TIME] synced: offset_ms={self._time_offset_ms}")
+        except Exception as e:
+            # don't hard-fail on time sync; keep last offset
+            if force or self._time_offset_ts == 0.0:
+                print(f"[TIME] WARN: cannot sync time: {e}. Using offset_ms={self._time_offset_ms}")
+            self._time_offset_ts = now
+            return
+
     async def _signed(self, method: str, path: str, params: dict):
         """Signed REST call (Binance-like Futures).
 
