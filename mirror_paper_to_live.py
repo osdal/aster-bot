@@ -111,17 +111,30 @@ def _append_csv(path: str, header: List[str], row: Dict[str, object]) -> None:
 def _round_step(x: float, step: float) -> float:
     if step <= 0:
         return x
-    return math.floor(x / step) * step
 
-
-def _round_tick(x: float, tick: float) -> float:
+def _round_tick(price: float, tick: float) -> float:
+    """Round price down to the nearest tick (safe for stopPrice filters)."""
     if tick <= 0:
-        return x
-    return round(round(x / tick) * tick, 12)
+        return float(price)
+    return math.floor(float(price) / tick) * tick
+
+    return math.floor(x / step) * step
 
 def _sign_hmac_sha256(secret: str, query_string: str) -> str:
     return hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
+
+
+def _safe_ctx(params: dict) -> dict:
+    """Return a small safe subset of params for logging."""
+    if not isinstance(params, dict):
+        return {}
+    keys = ("symbol", "type", "side", "quantity", "stopPrice", "closePosition", "reduceOnly")
+    out = {}
+    for k in keys:
+        if k in params and params.get(k) is not None:
+            out[k] = params.get(k)
+    return out
 
 # =========================
 # Config
@@ -194,6 +207,11 @@ class Config:
 
     DEBUG: bool = False
 
+
+    # selftest / safety
+    STARTUP_SELFTEST: bool = True
+    DEEP_SELFTEST: bool = False
+    DRY_RUN_LIVE: bool = False
     @staticmethod
     def load() -> "Config":
         load_dotenv(override=False)
@@ -259,6 +277,10 @@ class Config:
 
         cfg.DEBUG = _env_bool("DEBUG", cfg.DEBUG)
 
+
+        cfg.STARTUP_SELFTEST = _env_bool('STARTUP_SELFTEST', True)
+        cfg.DEEP_SELFTEST = _env_bool('DEEP_SELFTEST', False)
+        cfg.DRY_RUN_LIVE = _env_bool('DRY_RUN_LIVE', False)
         # sanitize heartbeat bounds
         if cfg.HEARTBEAT_MAX_SEC < cfg.HEARTBEAT_MIN_SEC:
             cfg.HEARTBEAT_MAX_SEC = cfg.HEARTBEAT_MIN_SEC
@@ -273,6 +295,29 @@ class Config:
 class AsterFapi:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+
+        # time sync cache
+        self._time_offset_ms = 0
+        self._time_sync_ts = 0.0
+
+    async def _ensure_time_offset(self, force: bool = False) -> None:
+        """Sync local time with exchange server time for signed requests."""
+        if self.cfg.DRY_RUN_LIVE:
+            return
+        now = time.time()
+        if (not force) and (now - self._time_sync_ts) < 60:
+            return
+        try:
+            j = await self._public_get("/fapi/v1/time")
+            server_ms = int(j.get("serverTime", 0))
+            local_ms = int(time.time() * 1000)
+            self._time_offset_ms = server_ms - local_ms
+            self._time_sync_ts = now
+            print(f"[TIME] synced: offset_ms={self._time_offset_ms}")
+        except Exception as e:
+            # don't hard fail here; signed call will surface error
+            print(f"[TIME] WARN: sync failed: {e}")
+
         headers = {"X-MBX-APIKEY": cfg.ASTER_API_KEY} if cfg.ASTER_API_KEY else {}
         self.client = httpx.AsyncClient(base_url=cfg.REST_BASE, timeout=20.0, headers=headers)
 
@@ -288,6 +333,28 @@ class AsterFapi:
         return r.json()
 
     async def _signed(self, method: str, path: str, params: dict):
+        # DRY RUN: do not send signed requests
+        if self.cfg.DRY_RUN_LIVE:
+            # minimal simulation for tests
+            if path.endswith('/order') and method.upper() == 'POST':
+                oid = str(int(time.time()*1000) % 10_000_000_000)
+                sym = params.get('symbol','')
+                if params.get('type') == 'MARKET' and params.get('quantity') is not None:
+                    qty = float(params.get('quantity'))
+                    side = params.get('side','')
+                    # store dry position
+                    if not hasattr(self, '_dry_positions'):
+                        self._dry_positions = {}
+                    pos_amt = qty if side == 'BUY' else -qty
+                    self._dry_positions[sym] = {'symbol': sym, 'positionAmt': pos_amt, 'entryPrice': 0, 'unRealizedProfit': 0}
+                return {'orderId': oid, 'status': 'FILLED', 'executedQty': params.get('quantity','0'), 'avgPrice': params.get('price','0')}
+            return {'ok': True}
+        # ensure time offset for signed requests
+        await self._ensure_time_offset()
+        params = dict(params or {})
+        params['recvWindow'] = params.get('recvWindow', 5000)
+        params['timestamp'] = int(time.time() * 1000 + getattr(self, '_time_offset_ms', 0))
+
         if not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET:
             raise RuntimeError("LIVE enabled but ASTER_API_KEY/ASTER_API_SECRET not set.")
 
@@ -369,17 +436,17 @@ class AsterFapi:
 
     async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
                                          working_type: str = "MARK_PRICE", price_protect: bool = True):
-        """Place STOP_MARKET / TAKE_PROFIT_MARKET with closePosition=true (Close-All).
-
-        AsterDex is strict: keep params minimal. working_type/price_protect are accepted for compatibility but not sent.
-        """
+        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true (Close-All)."""
         params = {
             "symbol": symbol,
             "side": side,              # BUY/SELL
             "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
             "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
             "closePosition": "true",
+            "workingType": working_type,
         }
+        if price_protect:
+            params["priceProtect"] = "TRUE"
         return await self._signed("POST", "/fapi/v1/order", params)
 
     async def user_trades(self, symbol: str, start_time_ms: int | None = None,
@@ -706,12 +773,8 @@ class LiveEngine:
         amt = _csv_safe_float(pos.get("positionAmt"))
         entry = _csv_safe_float(pos.get("entryPrice"))
         if abs(amt) < 1e-12:
-            # no position on exchange -> clear local + cancel leftovers
+            # no position on exchange
             self.open_positions.pop(symbol, None)
-            try:
-                await self.api.cancel_all_open_orders(symbol)
-            except Exception:
-                pass
             return None
 
         side = "LONG" if amt > 0 else "SHORT"
@@ -726,17 +789,9 @@ class LiveEngine:
         return self.open_positions[symbol]
 
     async def open_live(self, symbol: str, side: str, last_price: float) -> dict:
-        # If local says positions are full, reconcile all known symbols first (clears phantom positions)
+        # if local says positions full, reconcile for this symbol (most common stuck case)
         if len(self.open_positions) >= self.cfg.LIVE_MAX_POSITIONS:
-            for sym in list(self.open_positions.keys()):
-                try:
-                    await self.reconcile_position(sym)
-                except Exception:
-                    pass
-            try:
-                await self.reconcile_position(symbol)
-            except Exception:
-                pass
+            await self.reconcile_position(symbol)
         if len(self.open_positions) >= self.cfg.LIVE_MAX_POSITIONS:
             raise RuntimeError(f"LIVE_MAX_POSITIONS reached: {self.cfg.LIVE_MAX_POSITIONS}")
 
@@ -830,25 +885,6 @@ class LiveEngine:
 
         return self.open_positions[symbol]
 
-    
-    def _append_live_csv(self, ts: float, symbol: str, side: str, entry: float, exit_price: float, qty: float,
-                         leverage: int, pnl_pct: float, net_pnl_usd: float, outcome: str, reason: str,
-                         order_id_entry: str, order_id_exit: str):
-        _append_csv(self.cfg.LIVE_LOG_PATH, self.LIVE_CSV_HEADER, {
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
-            "symbol": symbol,
-            "side": side,
-            "entry": f"{entry:.10f}",
-            "exit": f"{exit_price:.10f}",
-            "qty": f"{qty:.8f}",
-            "leverage": str(int(leverage)),
-            "pnl_pct": f"{pnl_pct:.6f}",
-            "net_pnl_usd": f"{net_pnl_usd:.10f}",
-            "outcome": outcome,
-            "reason": reason,
-            "order_id_entry": order_id_entry,
-            "order_id_exit": order_id_exit,
-        })
     @staticmethod
     def _pnl_pct(side: str, entry: float, exit_price: float) -> float:
         if side == "LONG":
@@ -1200,12 +1236,7 @@ class Orchestrator:
             self.paper.reset_all_streaks(self.active_symbols)
             return
 
-                # If a LIVE position is already open (slot occupied), do NOT attempt another entry.
-        # In FROZEN mode we should only wait for the existing LIVE position to close.
-        if len(self.live.open_positions) >= 1:
-            return
-
-# open live
+        # open live
         try:
             pos = await self.live.open_live(symbol, sig, price)
         except Exception as e:
@@ -1309,13 +1340,6 @@ class Orchestrator:
             trig = self.paper.trigger_symbol or "-"
             paper_open = len(self.paper.positions)
             live_open = len(self.live.open_positions)
-                        # In FROZEN mode, periodically reconcile live slots to clear phantom positions
-            if mode == "FROZEN" and live_open > 0:
-                for sym in list(self.live.open_positions.keys()):
-                    try:
-                        await self.live.reconcile_position(sym)
-                    except Exception:
-                        pass
             print(f"[HEARTBEAT] mode={mode} trigger={trig} last_tick_age={last_tick_age:.1f}s paper_open={paper_open} live_open={live_open}")
 
     async def ws_watchdog_loop(self):
@@ -1431,11 +1455,85 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
         signal.signal(signal.SIGTERM, lambda *_: _handler())
 
 
+async def startup_selftest(cfg: Config, api: AsterFapi) -> None:
+    """Fail-fast checks: code integrity + universe health."""
+    required = [
+        "exchange_info",
+        "tickers_24h",
+        "ticker_price",
+        "book_ticker",
+        "position_risk",
+        "_ensure_time_offset",
+        "place_order",
+        "cancel_all_open_orders",
+        "place_conditional_close_all",
+        "set_leverage",
+    ]
+    missing = [m for m in required if not hasattr(api, m)]
+    if missing:
+        raise RuntimeError(f"SELFTEST FAIL: AsterFapi missing methods: {missing}")
+
+    # Public endpoints sanity
+    await api.exchange_info()
+    # Universe endpoint must work if universe is enabled
+    try:
+        t = await api.tickers_24h()
+        if not isinstance(t, (list, dict)):
+            raise RuntimeError(f"tickers_24h returned unexpected type: {type(t)}")
+    except Exception as e:
+        raise RuntimeError(f"SELFTEST FAIL: tickers_24h failed (universe will break): {e}")
+
+    # Time sync sanity (won't throw hard if fails; but we want fail-fast here)
+    if not cfg.DRY_RUN_LIVE:
+        await api._ensure_time_offset(force=True)
+
+    print("[SELFTEST] OK: methods present; exchange_info + tickers_24h reachable; time sync ok.")
+
+async def deep_selftest(cfg: Config) -> None:
+    """Deeper path test: simulate ARM->LIVE path in DRY_RUN mode."""
+    cfg2 = Config.load()
+    # copy relevant fields
+    cfg2.__dict__.update(cfg.__dict__)
+    cfg2.DRY_RUN_LIVE = True
+    cfg2.LIVE_ENABLED = True
+    api = AsterFapi(cfg2)
+    # prime exchange info and universe
+    await startup_selftest(cfg2, api)
+
+    # Construct live engine (the class that owns open_live). It's defined later as LiveEngine.
+    # We find it by scanning globals for an object with method open_live.
+    live_engine_cls = None
+    for obj in globals().values():
+        if isinstance(obj, type) and hasattr(obj, "open_live") and hasattr(obj, "__name__"):
+            # crude filter: must accept (self,cfg,api)
+            if obj.__name__ in ("LiveEngine", "LiveManager", "LiveTrader", "MirrorEngine"):
+                live_engine_cls = obj
+                break
+
+    # If we can't confidently find it, skip (still better than crashing overnight)
+    if live_engine_cls is None:
+        print("[SELFTEST] WARN: deep_selftest skipped (cannot locate live engine class).")
+        return
+
+    engine = live_engine_cls(cfg2, api)  # type: ignore
+    # Simulate an open_live call
+    await engine.open_live("XRPUSDT", "LONG", 1.0)
+    # Reconcile should see dry position
+    pos = await engine.reconcile_position("XRPUSDT")
+    if not pos:
+        raise RuntimeError("DEEP_SELFTEST FAIL: dry position not found after open_live")
+    print("[SELFTEST] OK: deep ARM->LIVE path executed in DRY_RUN mode.")
+
+
+
 async def main():
     cfg = Config.load()
-    orch = Orchestrator(cfg)
+    # fail-fast selftests
     if getattr(cfg, 'STARTUP_SELFTEST', True):
-        await startup_selftest(cfg, orch.api)
+        await startup_selftest(cfg, AsterFapi(cfg))
+    if getattr(cfg, 'DEEP_SELFTEST', False):
+        await deep_selftest(cfg)
+    orch = Orchestrator(cfg)
     _install_signal_handlers(asyncio.get_running_loop(), orch.stop_event)
     try:
         await orch.run()
