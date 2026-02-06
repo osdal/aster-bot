@@ -832,11 +832,40 @@ class LiveEngine:
             raise RuntimeError(f"Calculated qty {qty} < minQty {min_qty} for {symbol}. Increase LIVE_NOTIONAL_USD or leverage.")
 
         order_side = "BUY" if side == "LONG" else "SELL"
-        print(f"[LIVE] ENTRY {symbol} {side} market side={order_side} qty={qty:.8f} last={last_price:.6g}")
 
-        res = await self.api.place_order(symbol, order_side, qty, reduce_only=False)
-        order_id = res.get("orderId", "")
+        # Auto-backoff on insufficient margin (-2019): try smaller sizes, then DISARM.
+        base_qty = qty
+        multipliers = [1.0, 0.70, 0.50, 0.35]
+        last_err: Optional[str] = None
+        res = None
+        order_id = ""
+        for i, mult in enumerate(multipliers, start=1):
+            qty_try = base_qty * mult
+            qty_try = _round_step(qty_try, step) if step > 0 else qty_try
+            # avoid going below minQty due to rounding
+            if qty_try < min_qty:
+                last_err = f"qty_try {qty_try} < minQty {min_qty}"
+                print(f"[LIVE] WARN: attempt {i}/{len(multipliers)} skipped: {last_err}")
+                continue
 
+            print(f"[LIVE] ENTRY {symbol} {side} market side={order_side} qty={qty_try:.8f} last={last_price:.6g} (attempt {i}/{len(multipliers)})")
+            try:
+                res = await self.api.place_order(symbol, order_side, qty_try, reduce_only=False)
+                order_id = res.get("orderId", "")
+                qty = qty_try
+                break
+            except Exception as e:
+                s = str(e)
+                # our signed wrapper includes body=...; detect -2019 explicitly
+                if ("\"code\":-2019" in s) or ("code': -2019" in s) or ("Margin is insufficient" in s):
+                    last_err = s
+                    print(f"[LIVE] WARN: insufficient margin on attempt {i}/{len(multipliers)} -> trying smaller qty")
+                    await asyncio.sleep(2)
+                    continue
+                raise
+
+        if res is None:
+            raise RuntimeError(f"DISARM_MARGIN: margin insufficient after {len(multipliers)} attempts. Last={last_err}")
         # prefer executed qty/avg price; if bad -> reconcile via positionRisk
         executed = _csv_safe_float(res.get("executedQty"))
         avg = _csv_safe_float(res.get("avgPrice") or res.get("price") or last_price)
@@ -1262,7 +1291,15 @@ class Orchestrator:
         try:
             pos = await self.live.open_live(symbol, sig, price)
         except Exception as e:
-            print(f"[LIVE] ERROR: cannot open live: {e}")
+            msg = str(e)
+            print(f"[LIVE] ERROR: cannot open live: {msg}")
+            if "DISARM_MARGIN" in msg:
+                # Disarm: unfreeze PAPER and clear streak for this symbol to avoid immediate re-arm loop.
+                self.paper.freeze_paper_entries = False
+                self.paper.freeze_streak_updates = False
+                self.paper.trigger_symbol = None
+                self.paper.streak_losses[symbol] = 0
+                print(f"[ARM] DISARM {symbol}: {msg}. Resuming PAPER.")
             return
 
         # watch, then reset
