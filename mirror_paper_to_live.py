@@ -181,6 +181,9 @@ class Config:
 
     # live
     LIVE_ENABLED: bool = True
+    DRY_RUN_LIVE: bool = False  # if true, no signed orders are sent
+    STARTUP_SELFTEST: bool = True  # run self-test at startup
+    SELFTEST_TIMEOUT_SEC: int = 8
     LIVE_LOG_PATH: str = "data/live_trades.csv"
     LIVE_NOTIONAL_USD: float = 5.0
     LIVE_LEVERAGE: int = 2
@@ -251,6 +254,9 @@ class Config:
         cfg.LOSS_STREAK_TO_ARM = _env_int("LOSS_STREAK_TO_ARM", cfg.LOSS_STREAK_TO_ARM)
 
         cfg.LIVE_ENABLED = _env_bool("LIVE_ENABLED", _env_bool("LIVE_MODE", cfg.LIVE_ENABLED))
+        cfg.DRY_RUN_LIVE = _env_bool("DRY_RUN_LIVE", cfg.DRY_RUN_LIVE)
+        cfg.STARTUP_SELFTEST = _env_bool("STARTUP_SELFTEST", cfg.STARTUP_SELFTEST)
+        cfg.SELFTEST_TIMEOUT_SEC = int(os.getenv("SELFTEST_TIMEOUT_SEC", str(cfg.SELFTEST_TIMEOUT_SEC)))
         cfg.LIVE_LOG_PATH = _env_str("LIVE_LOG_PATH", cfg.LIVE_LOG_PATH)
         cfg.LIVE_NOTIONAL_USD = _env_float("LIVE_NOTIONAL_USD", cfg.LIVE_NOTIONAL_USD)
         cfg.LIVE_LEVERAGE = _env_int("LIVE_LEVERAGE", cfg.LIVE_LEVERAGE)
@@ -298,12 +304,31 @@ class AsterFapi:
     async def close(self):
         await self.client.aclose()
 
+    async def _ensure_time_offset(self, force: bool = False) -> None:
+        """Sync local time with exchange server time to avoid signed-request timestamp errors."""
+        now = time.time()
+        # resync at most once per 60s unless forced
+        if not force and self._time_offset_ts and (now - float(self._time_offset_ts)) < 60.0:
+            return
+        try:
+            j = await self._public_get("/fapi/v1/time")
+            server_ms = int(j.get("serverTime") or 0)
+            if server_ms <= 0:
+                return
+            self._time_offset_ms = server_ms - _now_ms()
+            self._time_offset_ts = now
+            print(f"[TIME] synced: offset_ms={self._time_offset_ms}")
+        except Exception as e:
+            print("[TIME] WARN: sync failed:", e)
+
     async def _public_get(self, path: str, params: dict | None = None):
         r = await self.client.get(path, params=params)
         r.raise_for_status()
         return r.json()
 
     async def _signed(self, method: str, path: str, params: dict):
+        if self.cfg.DRY_RUN_LIVE:
+            return {"dryRun": True, "method": method, "path": path, "params": dict(params or {})}
         """Signed REST call (Binance-like Futures).
 
         - Uses exchange server time offset to avoid -1021 timestamp errors.
@@ -1451,6 +1476,26 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
         signal.signal(signal.SIGINT, lambda *_: _handler())
         signal.signal(signal.SIGTERM, lambda *_: _handler())
 
+
+
+
+async def startup_selftest(cfg: Config, api: "AsterFapi") -> None:
+    """Fail-fast checks so the bot doesn't run overnight with a broken build."""
+    import inspect
+    required = ["exchange_info", "tickers_24h", "ticker_price", "book_ticker", "position_risk", "_ensure_time_offset"]
+    missing = [name for name in required if not hasattr(api, name)]
+    if missing:
+        raise RuntimeError(f"SELFTEST FAIL: AsterFapi missing methods: {missing}")
+    not_coro = [name for name in required if not inspect.iscoroutinefunction(getattr(api, name))]
+    if not_coro:
+        raise RuntimeError(f"SELFTEST FAIL: expected async methods but got non-async: {not_coro}")
+    await asyncio.wait_for(api.exchange_info(), timeout=cfg.SELFTEST_TIMEOUT_SEC)
+    await asyncio.wait_for(api.tickers_24h(), timeout=cfg.SELFTEST_TIMEOUT_SEC)
+    if cfg.LIVE_ENABLED and (not cfg.DRY_RUN_LIVE):
+        if not cfg.ASTER_API_KEY or not cfg.ASTER_API_SECRET:
+            raise RuntimeError("SELFTEST FAIL: LIVE_ENABLED=true but ASTER_API_KEY/ASTER_API_SECRET missing.")
+        await api._ensure_time_offset(force=True)
+    print("[SELFTEST] OK")
 
 async def main():
     cfg = Config.load()
