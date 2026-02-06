@@ -88,25 +88,6 @@ def _csv_safe_float(x) -> float:
     except Exception:
         return float("nan")
 
-
-def _safe_ctx(params):
-    """Return a compact, safe context dict for logging request params."""
-    try:
-        if not isinstance(params, dict):
-            return {"params": str(params)}
-        keys = ("symbol", "type", "side", "quantity", "stopPrice", "price", "closePosition",
-                "reduceOnly", "timeInForce", "workingType", "positionSide")
-        out = {}
-        for k in keys:
-            if k in params:
-                out[k] = params.get(k)
-        # Keep it short
-        if not out:
-            return {"keys": list(params.keys())[:10]}
-        return out
-    except Exception:
-        return {"params": "<?>"} 
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -131,6 +112,12 @@ def _round_step(x: float, step: float) -> float:
     if step <= 0:
         return x
     return math.floor(x / step) * step
+
+
+def _round_tick(x: float, tick: float) -> float:
+    if tick <= 0:
+        return x
+    return round(round(x / tick) * tick, 12)
 
 def _sign_hmac_sha256(secret: str, query_string: str) -> str:
     return hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -181,9 +168,6 @@ class Config:
 
     # live
     LIVE_ENABLED: bool = True
-    DRY_RUN_LIVE: bool = False  # if true, no signed orders are sent
-    STARTUP_SELFTEST: bool = True  # run self-test at startup
-    SELFTEST_TIMEOUT_SEC: int = 8
     LIVE_LOG_PATH: str = "data/live_trades.csv"
     LIVE_NOTIONAL_USD: float = 5.0
     LIVE_LEVERAGE: int = 2
@@ -254,9 +238,6 @@ class Config:
         cfg.LOSS_STREAK_TO_ARM = _env_int("LOSS_STREAK_TO_ARM", cfg.LOSS_STREAK_TO_ARM)
 
         cfg.LIVE_ENABLED = _env_bool("LIVE_ENABLED", _env_bool("LIVE_MODE", cfg.LIVE_ENABLED))
-        cfg.DRY_RUN_LIVE = _env_bool("DRY_RUN_LIVE", cfg.DRY_RUN_LIVE)
-        cfg.STARTUP_SELFTEST = _env_bool("STARTUP_SELFTEST", cfg.STARTUP_SELFTEST)
-        cfg.SELFTEST_TIMEOUT_SEC = int(os.getenv("SELFTEST_TIMEOUT_SEC", str(cfg.SELFTEST_TIMEOUT_SEC)))
         cfg.LIVE_LOG_PATH = _env_str("LIVE_LOG_PATH", cfg.LIVE_LOG_PATH)
         cfg.LIVE_NOTIONAL_USD = _env_float("LIVE_NOTIONAL_USD", cfg.LIVE_NOTIONAL_USD)
         cfg.LIVE_LEVERAGE = _env_int("LIVE_LEVERAGE", cfg.LIVE_LEVERAGE)
@@ -298,28 +279,8 @@ class AsterFapi:
         self._exchange_info = None
         self._symbol_filters: Dict[str, Dict[str, float]] = {}  # stepSize/minQty/minNotional
 
-        self._time_offset_ms: int = 0
-        self._time_offset_ts: float = 0.0
-
     async def close(self):
         await self.client.aclose()
-
-    async def _ensure_time_offset(self, force: bool = False) -> None:
-        """Sync local time with exchange server time to avoid signed-request timestamp errors."""
-        now = time.time()
-        # resync at most once per 60s unless forced
-        if not force and self._time_offset_ts and (now - float(self._time_offset_ts)) < 60.0:
-            return
-        try:
-            j = await self._public_get("/fapi/v1/time")
-            server_ms = int(j.get("serverTime") or 0)
-            if server_ms <= 0:
-                return
-            self._time_offset_ms = server_ms - _now_ms()
-            self._time_offset_ts = now
-            print(f"[TIME] synced: offset_ms={self._time_offset_ms}")
-        except Exception as e:
-            print("[TIME] WARN: sync failed:", e)
 
     async def _public_get(self, path: str, params: dict | None = None):
         r = await self.client.get(path, params=params)
@@ -327,56 +288,20 @@ class AsterFapi:
         return r.json()
 
     async def _signed(self, method: str, path: str, params: dict):
-        if self.cfg.DRY_RUN_LIVE:
-            return {"dryRun": True, "method": method, "path": path, "params": dict(params or {})}
-        """Signed REST call (Binance-like Futures).
-
-        - Uses exchange server time offset to avoid -1021 timestamp errors.
-        - Adds recvWindow by default.
-        - On HTTP errors, raises with response body included (helps debug 400s).
-        """
         if not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET:
             raise RuntimeError("LIVE enabled but ASTER_API_KEY/ASTER_API_SECRET not set.")
 
         params = dict(params or {})
+        params["timestamp"] = _now_ms()
 
-        await self._ensure_time_offset()
-
-        params.setdefault("recvWindow", int(getattr(self.cfg, "RECV_WINDOW_MS", 5000)))
-        params["timestamp"] = _now_ms() + int(self._time_offset_ms or 0)
-
+        # build query string in a version-agnostic way (no httpx.QueryParams.encode issues)
         qs = urlencode(params, doseq=True)
-        params["signature"] = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
+        sig = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
+        params["signature"] = sig
 
-        try:
-            r = await self.client.request(method, path, params=params)
-            r.raise_for_status()
-            return r.json()
-        except httpx.HTTPStatusError as e:
-            body = ""
-            try:
-                body = e.response.text
-            except Exception:
-                body = ""
-            # If timestamp drift, resync once and retry
-            if e.response is not None and e.response.status_code == 400 and ("-1021" in body or "timestamp" in body.lower()):
-                await self._ensure_time_offset(force=True)
-                params["timestamp"] = _now_ms() + int(self._time_offset_ms or 0)
-                qs2 = urlencode({k: v for k, v in params.items() if k != "signature"}, doseq=True)
-                params["signature"] = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs2)
-                r2 = await self.client.request(method, path, params=params)
-                try:
-                    r2.raise_for_status()
-                    return r2.json()
-                except httpx.HTTPStatusError as e2:
-                    body2 = ""
-                    try:
-                        body2 = e2.response.text
-                    except Exception:
-                        body2 = ""
-                    raise RuntimeError(f"HTTP {e2.response.status_code} {method} {path} params={_safe_ctx(params)} body={body2}") from None
-
-            raise RuntimeError(f"HTTP {e.response.status_code} {method} {path} params={_safe_ctx(params)} body={body}") from None
+        r = await self.client.request(method, path, params=params)
+        r.raise_for_status()
+        return r.json()
 
     async def exchange_info(self):
         if self._exchange_info is None:
@@ -391,42 +316,25 @@ class AsterFapi:
             sym = s.get("symbol")
             if not sym:
                 continue
-            filters = {f.get("filterType"): f for f in s.get("filters", []) if isinstance(f, dict) and f.get("filterType")}
-
-            tick = 0.0
-            if "PRICE_FILTER" in filters:
-                tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
-
+            filters = {f["filterType"]: f for f in s.get("filters", []) if isinstance(f, dict) and "filterType" in f}
             step = 0.0
             min_qty = 0.0
+            min_notional = 0.0
             if "LOT_SIZE" in filters:
                 step = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
                 min_qty = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
-
-            step_mkt = step
-            min_qty_mkt = min_qty
-            if "MARKET_LOT_SIZE" in filters:
-                step_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("stepSize", step_mkt))
-                min_qty_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("minQty", min_qty_mkt))
-
-            min_notional = 0.0
             if "MIN_NOTIONAL" in filters:
                 min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
             elif "NOTIONAL" in filters:
                 min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
-
             self._symbol_filters[sym] = {
-                "tickSize": tick,
                 "stepSize": step,
                 "minQty": min_qty,
-                "marketStepSize": step_mkt,
-                "marketMinQty": min_qty_mkt,
                 "minNotional": min_notional,
             }
 
-
     def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
-        return self._symbol_filters.get(symbol, {"tickSize": 0.0, "stepSize": 0.0, "minQty": 0.0, "marketStepSize": 0.0, "marketMinQty": 0.0, "minNotional": 0.0})
+        return self._symbol_filters.get(symbol, {"stepSize": 0.0, "minQty": 0.0, "minNotional": 0.0})
 
     async def book_ticker(self, symbol: str) -> Tuple[float, float]:
         j = await self._public_get("/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
@@ -459,12 +367,16 @@ class AsterFapi:
     async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
-    async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float):
-        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true. Keep params minimal."""
+    async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
+                                         working_type: str = "MARK_PRICE", price_protect: bool = True):
+        """Place STOP_MARKET / TAKE_PROFIT_MARKET with closePosition=true (Close-All).
+
+        AsterDex is strict: keep params minimal. working_type/price_protect are accepted for compatibility but not sent.
+        """
         params = {
             "symbol": symbol,
-            "side": side,
-            "type": order_type,
+            "side": side,              # BUY/SELL
+            "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
             "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
             "closePosition": "true",
         }
@@ -488,8 +400,7 @@ class AsterFapi:
             params["endTime"] = int(end_time_ms)
         return await self._signed("GET", "/fapi/v1/allOrders", params)
 
-    async def position_risk(self, symbol: str):
-        """Get position risk for a symbol (tries v2 then v1)."""
+async def position_risk(self, symbol: str):
         try:
             return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         except Exception:
@@ -795,8 +706,12 @@ class LiveEngine:
         amt = _csv_safe_float(pos.get("positionAmt"))
         entry = _csv_safe_float(pos.get("entryPrice"))
         if abs(amt) < 1e-12:
-            # no position on exchange
+            # no position on exchange -> clear local + cancel leftovers
             self.open_positions.pop(symbol, None)
+            try:
+                await self.api.cancel_all_open_orders(symbol)
+            except Exception:
+                pass
             return None
 
         side = "LONG" if amt > 0 else "SHORT"
@@ -811,9 +726,17 @@ class LiveEngine:
         return self.open_positions[symbol]
 
     async def open_live(self, symbol: str, side: str, last_price: float) -> dict:
-        # if local says positions full, reconcile for this symbol (most common stuck case)
+        # If local says positions are full, reconcile all known symbols first (clears phantom positions)
         if len(self.open_positions) >= self.cfg.LIVE_MAX_POSITIONS:
-            await self.reconcile_position(symbol)
+            for sym in list(self.open_positions.keys()):
+                try:
+                    await self.reconcile_position(sym)
+                except Exception:
+                    pass
+            try:
+                await self.reconcile_position(symbol)
+            except Exception:
+                pass
         if len(self.open_positions) >= self.cfg.LIVE_MAX_POSITIONS:
             raise RuntimeError(f"LIVE_MAX_POSITIONS reached: {self.cfg.LIVE_MAX_POSITIONS}")
 
@@ -824,48 +747,19 @@ class LiveEngine:
         qty = notional_effective / last_price
 
         f = self.api.get_symbol_filters(symbol)
-        step = float(f.get("marketStepSize", f.get("stepSize", 0.0)) or 0.0)
-        min_qty = float(f.get("marketMinQty", f.get("minQty", 0.0)) or 0.0)
+        step = float(f.get("stepSize", 0.0) or 0.0)
+        min_qty = float(f.get("minQty", 0.0) or 0.0)
 
         qty = _round_step(qty, step) if step > 0 else qty
         if qty < min_qty:
             raise RuntimeError(f"Calculated qty {qty} < minQty {min_qty} for {symbol}. Increase LIVE_NOTIONAL_USD or leverage.")
 
         order_side = "BUY" if side == "LONG" else "SELL"
+        print(f"[LIVE] ENTRY {symbol} {side} market side={order_side} qty={qty:.8f} last={last_price:.6g}")
 
-        # Auto-backoff on insufficient margin (-2019): try smaller sizes, then DISARM.
-        base_qty = qty
-        multipliers = [1.0, 0.70, 0.50, 0.35]
-        last_err: Optional[str] = None
-        res = None
-        order_id = ""
-        for i, mult in enumerate(multipliers, start=1):
-            qty_try = base_qty * mult
-            qty_try = _round_step(qty_try, step) if step > 0 else qty_try
-            # avoid going below minQty due to rounding
-            if qty_try < min_qty:
-                last_err = f"qty_try {qty_try} < minQty {min_qty}"
-                print(f"[LIVE] WARN: attempt {i}/{len(multipliers)} skipped: {last_err}")
-                continue
+        res = await self.api.place_order(symbol, order_side, qty, reduce_only=False)
+        order_id = res.get("orderId", "")
 
-            print(f"[LIVE] ENTRY {symbol} {side} market side={order_side} qty={qty_try:.8f} last={last_price:.6g} (attempt {i}/{len(multipliers)})")
-            try:
-                res = await self.api.place_order(symbol, order_side, qty_try, reduce_only=False)
-                order_id = res.get("orderId", "")
-                qty = qty_try
-                break
-            except Exception as e:
-                s = str(e)
-                # our signed wrapper includes body=...; detect -2019 explicitly
-                if ("\"code\":-2019" in s) or ("code': -2019" in s) or ("Margin is insufficient" in s):
-                    last_err = s
-                    print(f"[LIVE] WARN: insufficient margin on attempt {i}/{len(multipliers)} -> trying smaller qty")
-                    await asyncio.sleep(2)
-                    continue
-                raise
-
-        if res is None:
-            raise RuntimeError(f"DISARM_MARGIN: margin insufficient after {len(multipliers)} attempts. Last={last_err}")
         # prefer executed qty/avg price; if bad -> reconcile via positionRisk
         executed = _csv_safe_float(res.get("executedQty"))
         avg = _csv_safe_float(res.get("avgPrice") or res.get("price") or last_price)
@@ -936,6 +830,25 @@ class LiveEngine:
 
         return self.open_positions[symbol]
 
+    
+    def _append_live_csv(self, ts: float, symbol: str, side: str, entry: float, exit_price: float, qty: float,
+                         leverage: int, pnl_pct: float, net_pnl_usd: float, outcome: str, reason: str,
+                         order_id_entry: str, order_id_exit: str):
+        _append_csv(self.cfg.LIVE_LOG_PATH, self.LIVE_CSV_HEADER, {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+            "symbol": symbol,
+            "side": side,
+            "entry": f"{entry:.10f}",
+            "exit": f"{exit_price:.10f}",
+            "qty": f"{qty:.8f}",
+            "leverage": str(int(leverage)),
+            "pnl_pct": f"{pnl_pct:.6f}",
+            "net_pnl_usd": f"{net_pnl_usd:.10f}",
+            "outcome": outcome,
+            "reason": reason,
+            "order_id_entry": order_id_entry,
+            "order_id_exit": order_id_exit,
+        })
     @staticmethod
     def _pnl_pct(side: str, entry: float, exit_price: float) -> float:
         if side == "LONG":
@@ -955,7 +868,7 @@ class LiveEngine:
 
         # apply step rounding
         f = self.api.get_symbol_filters(symbol)
-        step = float(f.get("marketStepSize", f.get("stepSize", 0.0)) or 0.0)
+        step = float(f.get("stepSize", 0.0) or 0.0)
         qty = _round_step(qty, step) if step > 0 else qty
         if qty <= 0:
             raise RuntimeError("Rounded qty=0, cannot close.")
@@ -1287,19 +1200,16 @@ class Orchestrator:
             self.paper.reset_all_streaks(self.active_symbols)
             return
 
-        # open live
+                # If a LIVE position is already open (slot occupied), do NOT attempt another entry.
+        # In FROZEN mode we should only wait for the existing LIVE position to close.
+        if len(self.live.open_positions) >= 1:
+            return
+
+# open live
         try:
             pos = await self.live.open_live(symbol, sig, price)
         except Exception as e:
-            msg = str(e)
-            print(f"[LIVE] ERROR: cannot open live: {msg}")
-            if "DISARM_MARGIN" in msg:
-                # Disarm: unfreeze PAPER and clear streak for this symbol to avoid immediate re-arm loop.
-                self.paper.freeze_paper_entries = False
-                self.paper.freeze_streak_updates = False
-                self.paper.trigger_symbol = None
-                self.paper.streak_losses[symbol] = 0
-                print(f"[ARM] DISARM {symbol}: {msg}. Resuming PAPER.")
+            print(f"[LIVE] ERROR: cannot open live: {e}")
             return
 
         # watch, then reset
@@ -1399,6 +1309,13 @@ class Orchestrator:
             trig = self.paper.trigger_symbol or "-"
             paper_open = len(self.paper.positions)
             live_open = len(self.live.open_positions)
+                        # In FROZEN mode, periodically reconcile live slots to clear phantom positions
+            if mode == "FROZEN" and live_open > 0:
+                for sym in list(self.live.open_positions.keys()):
+                    try:
+                        await self.live.reconcile_position(sym)
+                    except Exception:
+                        pass
             print(f"[HEARTBEAT] mode={mode} trigger={trig} last_tick_age={last_tick_age:.1f}s paper_open={paper_open} live_open={live_open}")
 
     async def ws_watchdog_loop(self):
@@ -1514,29 +1431,11 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
         signal.signal(signal.SIGTERM, lambda *_: _handler())
 
 
-
-
-async def startup_selftest(cfg: Config, api: "AsterFapi") -> None:
-    """Fail-fast checks so the bot doesn't run overnight with a broken build."""
-    import inspect
-    required = ["exchange_info", "tickers_24h", "ticker_price", "book_ticker", "position_risk", "_ensure_time_offset"]
-    missing = [name for name in required if not hasattr(api, name)]
-    if missing:
-        raise RuntimeError(f"SELFTEST FAIL: AsterFapi missing methods: {missing}")
-    not_coro = [name for name in required if not inspect.iscoroutinefunction(getattr(api, name))]
-    if not_coro:
-        raise RuntimeError(f"SELFTEST FAIL: expected async methods but got non-async: {not_coro}")
-    await asyncio.wait_for(api.exchange_info(), timeout=cfg.SELFTEST_TIMEOUT_SEC)
-    await asyncio.wait_for(api.tickers_24h(), timeout=cfg.SELFTEST_TIMEOUT_SEC)
-    if cfg.LIVE_ENABLED and (not cfg.DRY_RUN_LIVE):
-        if not cfg.ASTER_API_KEY or not cfg.ASTER_API_SECRET:
-            raise RuntimeError("SELFTEST FAIL: LIVE_ENABLED=true but ASTER_API_KEY/ASTER_API_SECRET missing.")
-        await api._ensure_time_offset(force=True)
-    print("[SELFTEST] OK")
-
 async def main():
     cfg = Config.load()
     orch = Orchestrator(cfg)
+    if cfg.STARTUP_SELFTEST:
+        await startup_selftest(cfg, orch.api)
     _install_signal_handlers(asyncio.get_running_loop(), orch.stop_event)
     try:
         await orch.run()
