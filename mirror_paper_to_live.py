@@ -108,6 +108,12 @@ def _append_csv(path: str, header: List[str], row: Dict[str, object]) -> None:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in header})
 
+def _round_tick(x: float, tick: float) -> float:
+    if tick <= 0:
+        return x
+    return math.floor(x / tick) * tick
+
+
 def _round_step(x: float, step: float) -> float:
     if step <= 0:
         return x
@@ -348,31 +354,47 @@ class AsterFapi:
             self._parse_exchange_info(info)
         return self._exchange_info
 
-    def _parse_exchange_info(self, info: dict):
-        self._symbol_filters.clear()
-        for s in info.get("symbols", []):
-            sym = s.get("symbol")
-            if not sym:
-                continue
-            filters = {f["filterType"]: f for f in s.get("filters", []) if isinstance(f, dict) and "filterType" in f}
-            step = 0.0
-            min_qty = 0.0
-            min_notional = 0.0
-            if "LOT_SIZE" in filters:
-                step = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
-                min_qty = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
-            if "MIN_NOTIONAL" in filters:
-                min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
-            elif "NOTIONAL" in filters:
-                min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
-            self._symbol_filters[sym] = {
-                "stepSize": step,
-                "minQty": min_qty,
-                "minNotional": min_notional,
-            }
+def _parse_exchange_info(self, info: dict):
+    self._symbol_filters.clear()
+    for s in info.get("symbols", []):
+        sym = s.get("symbol")
+        if not sym:
+            continue
+        filters = {f["filterType"]: f for f in s.get("filters", []) if isinstance(f, dict) and "filterType" in f}
+
+        tick = 0.0
+        if "PRICE_FILTER" in filters:
+            tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
+
+        step_lot = 0.0
+        min_qty_lot = 0.0
+        if "LOT_SIZE" in filters:
+            step_lot = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
+            min_qty_lot = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
+
+        step_mkt = step_lot
+        min_qty_mkt = min_qty_lot
+        if "MARKET_LOT_SIZE" in filters:
+            step_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("stepSize", step_mkt))
+            min_qty_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("minQty", min_qty_mkt))
+
+        min_notional = 0.0
+        if "MIN_NOTIONAL" in filters:
+            min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
+        elif "NOTIONAL" in filters:
+            min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
+
+        self._symbol_filters[sym] = {
+            "tickSize": tick,
+            "stepSize": step_lot,
+            "minQty": min_qty_lot,
+            "marketStepSize": step_mkt,
+            "marketMinQty": min_qty_mkt,
+            "minNotional": min_notional,
+        }
 
     def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
-        return self._symbol_filters.get(symbol, {"stepSize": 0.0, "minQty": 0.0, "minNotional": 0.0})
+        return self._symbol_filters.get(symbol, {"tickSize": 0.0, "stepSize": 0.0, "minQty": 0.0, "marketStepSize": 0.0, "marketMinQty": 0.0, "minNotional": 0.0})
 
     async def book_ticker(self, symbol: str) -> Tuple[float, float]:
         j = await self._public_get("/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
@@ -405,20 +427,16 @@ class AsterFapi:
     async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
-    async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
-                                         working_type: str = "MARK_PRICE", price_protect: bool = True):
-        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true (Close-All)."""
-        params = {
-            "symbol": symbol,
-            "side": side,              # BUY/SELL
-            "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
-            "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
-            "closePosition": "true",
-            "workingType": working_type,
-        }
-        if price_protect:
-            params["priceProtect"] = "TRUE"
-        return await self._signed("POST", "/fapi/v1/order", params)
+async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float):
+    """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true. Keep params minimal for AsterDex."""
+    params = {
+        "symbol": symbol,
+        "side": side,              # BUY/SELL
+        "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
+        "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
+        "closePosition": "true",
+    }
+    return await self._signed("POST", "/fapi/v1/order", params)
 
     async def user_trades(self, symbol: str, start_time_ms: int | None = None,
                           end_time_ms: int | None = None, limit: int = 200):
@@ -789,8 +807,8 @@ class LiveEngine:
         qty = notional_effective / last_price
 
         f = self.api.get_symbol_filters(symbol)
-        step = float(f.get("stepSize", 0.0) or 0.0)
-        min_qty = float(f.get("minQty", 0.0) or 0.0)
+        step = float(f.get("marketStepSize", 0.0) or 0.0) or float(f.get("stepSize", 0.0) or 0.0)
+        min_qty = float(f.get("marketMinQty", 0.0) or 0.0) or float(f.get("minQty", 0.0) or 0.0)
 
         qty = _round_step(qty, step) if step > 0 else qty
         if qty < min_qty:
@@ -891,7 +909,7 @@ class LiveEngine:
 
         # apply step rounding
         f = self.api.get_symbol_filters(symbol)
-        step = float(f.get("stepSize", 0.0) or 0.0)
+        step = float(f.get("marketStepSize", 0.0) or 0.0) or float(f.get("stepSize", 0.0) or 0.0)
         qty = _round_step(qty, step) if step > 0 else qty
         if qty <= 0:
             raise RuntimeError("Rounded qty=0, cannot close.")
