@@ -142,6 +142,10 @@ class Config:
     WS_BASE: str = "wss://fstream.asterdex.com"
     WS_MODE: str = "AUTO"  # AUTO | COMBINED | SUBSCRIBE
 
+    # signed request timing
+    RECV_WINDOW_MS: int = 5000
+    TIME_SYNC_INTERVAL_SEC: int = 300  # resync server time every N seconds
+
     # symbol universe
     SYMBOL_MODE: str = "HYBRID_PRIORITY"  # HYBRID_PRIORITY | WHITELIST_ONLY
     WHITELIST: List[str] = None
@@ -287,6 +291,11 @@ class AsterFapi:
         self._exchange_info = None
         self._symbol_filters: Dict[str, Dict[str, float]] = {}  # stepSize/minQty/minNotional
 
+
+        # time sync (serverTime - localTime)
+        self._time_offset_ms: int = 0
+        self._last_time_sync: float = 0.0
+
     async def close(self):
         await self.client.aclose()
 
@@ -295,21 +304,77 @@ class AsterFapi:
         r.raise_for_status()
         return r.json()
 
+
+    async def sync_time(self, force: bool = False):
+        """Sync local clock with server clock for signed requests.
+        Computes offset_ms = serverTime_ms - local_now_ms.
+        """
+        now = time.time()
+        if (not force) and self._last_time_sync and (now - self._last_time_sync) < self.cfg.TIME_SYNC_INTERVAL_SEC:
+            return
+        try:
+            data = await self._public_get("/fapi/v1/time")
+            st = data.get("serverTime")
+            if isinstance(st, (int, float)):
+                self._time_offset_ms = int(st) - _now_ms()
+                self._last_time_sync = now
+                print(f"[TIME] synced: offset_ms={self._time_offset_ms}")
+        except Exception as e:
+            # don't hard-fail on time sync issues
+            print(f"[TIME] sync failed: {e}")
+
+
     async def _signed(self, method: str, path: str, params: dict):
         if not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET:
             raise RuntimeError("LIVE enabled but ASTER_API_KEY/ASTER_API_SECRET not set.")
 
         params = dict(params or {})
-        params["timestamp"] = _now_ms()
 
-        # build query string in a version-agnostic way (no httpx.QueryParams.encode issues)
-        qs = urlencode(params, doseq=True)
-        sig = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
-        params["signature"] = sig
+        # ensure server time sync (avoid -1021 timestamp errors)
+        await self.sync_time()
 
-        r = await self.client.request(method, path, params=params)
-        r.raise_for_status()
-        return r.json()
+        params["recvWindow"] = int(self.cfg.RECV_WINDOW_MS)
+        params["timestamp"] = _now_ms() + int(self._time_offset_ms)
+
+        def _make_signed(p: dict) -> dict:
+            qs = urlencode(p, doseq=True)
+            sig = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
+            p2 = dict(p)
+            p2["signature"] = sig
+            return p2
+
+        signed_params = _make_signed(params)
+
+        # one retry on timestamp error
+        for attempt in range(2):
+            try:
+                r = await self.client.request(method, path, params=signed_params)
+                r.raise_for_status()
+                return r.json()
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                body_text = e.response.text
+                # try decode json body if possible
+                j = None
+                try:
+                    j = e.response.json()
+                except Exception:
+                    pass
+
+                if status == 400:
+                    print(f"[LIVE] HTTP 400 on {path} params={{{'symbol': params.get('symbol'), 'type': params.get('type'), 'side': params.get('side'), 'quantity': params.get('quantity'), 'stopPrice': params.get('stopPrice')}}} body={body_text}")
+
+                # Binance-like timestamp error code
+                code = None
+                if isinstance(j, dict):
+                    code = j.get("code")
+                if attempt == 0 and code in (-1021, "1021"):
+                    # resync and retry
+                    await self.sync_time(force=True)
+                    params["timestamp"] = _now_ms() + int(self._time_offset_ms)
+                    signed_params = _make_signed(params)
+                    continue
+                raise
 
     async def exchange_info(self):
         if self._exchange_info is None:
