@@ -108,12 +108,6 @@ def _append_csv(path: str, header: List[str], row: Dict[str, object]) -> None:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in header})
 
-def _round_tick(x: float, tick: float) -> float:
-    if tick <= 0:
-        return x
-    return math.floor(x / tick) * tick
-
-
 def _round_step(x: float, step: float) -> float:
     if step <= 0:
         return x
@@ -280,7 +274,7 @@ class AsterFapi:
         self._symbol_filters: Dict[str, Dict[str, float]] = {}  # stepSize/minQty/minNotional
 
         self._time_offset_ms: int = 0
-        self._last_time_sync: float = 0.0
+        self._time_offset_ts: float = 0.0
 
     async def close(self):
         await self.client.aclose()
@@ -290,62 +284,55 @@ class AsterFapi:
         r.raise_for_status()
         return r.json()
 
-    async def sync_time(self, force: bool = False):
-        """Sync local timestamp offset with exchange server time."""
-        now = time.time()
-        if not force and self._last_time_sync and (now - self._last_time_sync) < 60:
-            return self._time_offset_ms
-        try:
-            j = await self._public_get("/fapi/v1/time")
-            st = int(j.get("serverTime"))
-            lt = _now_ms()
-            self._time_offset_ms = st - lt
-            self._last_time_sync = now
-            print(f"[TIME] synced: offset_ms={self._time_offset_ms}")
-        except Exception as e:
-            print(f"[TIME] sync failed: {e}")
-        return self._time_offset_ms
-
-
-
     async def _signed(self, method: str, path: str, params: dict):
+        """Signed REST call (Binance-like Futures).
+
+        - Uses exchange server time offset to avoid -1021 timestamp errors.
+        - Adds recvWindow by default.
+        - On HTTP errors, raises with response body included (helps debug 400s).
+        """
         if not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET:
             raise RuntimeError("LIVE enabled but ASTER_API_KEY/ASTER_API_SECRET not set.")
 
         params = dict(params or {})
-        params.setdefault("recvWindow", 5000)
 
-        if self._last_time_sync == 0.0:
-            await self.sync_time(force=True)
+        await self._ensure_time_offset()
 
-        params["timestamp"] = _now_ms() + int(self._time_offset_ms)
+        params.setdefault("recvWindow", int(getattr(self.cfg, "RECV_WINDOW_MS", 5000)))
+        params["timestamp"] = _now_ms() + int(self._time_offset_ms or 0)
 
-        def _with_sig(p: dict) -> dict:
-            p = dict(p)
-            qs = urlencode(p, doseq=True)
-            p["signature"] = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
-            return p
+        qs = urlencode(params, doseq=True)
+        params["signature"] = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
 
-        signed_params = _with_sig(params)
         try:
-            r = await self.client.request(method, path, params=signed_params)
+            r = await self.client.request(method, path, params=params)
             r.raise_for_status()
             return r.json()
         except httpx.HTTPStatusError as e:
-            code_val = None
+            body = ""
             try:
-                j = e.response.json()
-                code_val = j.get("code")
+                body = e.response.text
             except Exception:
-                pass
-            if code_val == -1021:
-                await self.sync_time(force=True)
-                params["timestamp"] = _now_ms() + int(self._time_offset_ms)
-                signed_params = _with_sig(params)
-                r2 = await self.client.request(method, path, params=signed_params)
-                r2.raise_for_status()
-                return r2.json()
-            raise
+                body = ""
+            # If timestamp drift, resync once and retry
+            if e.response is not None and e.response.status_code == 400 and ("-1021" in body or "timestamp" in body.lower()):
+                await self._ensure_time_offset(force=True)
+                params["timestamp"] = _now_ms() + int(self._time_offset_ms or 0)
+                qs2 = urlencode({k: v for k, v in params.items() if k != "signature"}, doseq=True)
+                params["signature"] = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs2)
+                r2 = await self.client.request(method, path, params=params)
+                try:
+                    r2.raise_for_status()
+                    return r2.json()
+                except httpx.HTTPStatusError as e2:
+                    body2 = ""
+                    try:
+                        body2 = e2.response.text
+                    except Exception:
+                        body2 = ""
+                    raise RuntimeError(f"HTTP {e2.response.status_code} {method} {path} params={_safe_ctx(params)} body={body2}") from None
+
+            raise RuntimeError(f"HTTP {e.response.status_code} {method} {path} params={_safe_ctx(params)} body={body}") from None
 
     async def exchange_info(self):
         if self._exchange_info is None:
@@ -354,44 +341,45 @@ class AsterFapi:
             self._parse_exchange_info(info)
         return self._exchange_info
 
-def _parse_exchange_info(self, info: dict):
-    self._symbol_filters.clear()
-    for s in info.get("symbols", []):
-        sym = s.get("symbol")
-        if not sym:
-            continue
-        filters = {f["filterType"]: f for f in s.get("filters", []) if isinstance(f, dict) and "filterType" in f}
+    def _parse_exchange_info(self, info: dict):
+        self._symbol_filters.clear()
+        for s in info.get("symbols", []):
+            sym = s.get("symbol")
+            if not sym:
+                continue
+            filters = {f.get("filterType"): f for f in s.get("filters", []) if isinstance(f, dict) and f.get("filterType")}
 
-        tick = 0.0
-        if "PRICE_FILTER" in filters:
-            tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
+            tick = 0.0
+            if "PRICE_FILTER" in filters:
+                tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
 
-        step_lot = 0.0
-        min_qty_lot = 0.0
-        if "LOT_SIZE" in filters:
-            step_lot = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
-            min_qty_lot = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
+            step = 0.0
+            min_qty = 0.0
+            if "LOT_SIZE" in filters:
+                step = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
+                min_qty = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
 
-        step_mkt = step_lot
-        min_qty_mkt = min_qty_lot
-        if "MARKET_LOT_SIZE" in filters:
-            step_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("stepSize", step_mkt))
-            min_qty_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("minQty", min_qty_mkt))
+            step_mkt = step
+            min_qty_mkt = min_qty
+            if "MARKET_LOT_SIZE" in filters:
+                step_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("stepSize", step_mkt))
+                min_qty_mkt = _csv_safe_float(filters["MARKET_LOT_SIZE"].get("minQty", min_qty_mkt))
 
-        min_notional = 0.0
-        if "MIN_NOTIONAL" in filters:
-            min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
-        elif "NOTIONAL" in filters:
-            min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
+            min_notional = 0.0
+            if "MIN_NOTIONAL" in filters:
+                min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
+            elif "NOTIONAL" in filters:
+                min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
 
-        self._symbol_filters[sym] = {
-            "tickSize": tick,
-            "stepSize": step_lot,
-            "minQty": min_qty_lot,
-            "marketStepSize": step_mkt,
-            "marketMinQty": min_qty_mkt,
-            "minNotional": min_notional,
-        }
+            self._symbol_filters[sym] = {
+                "tickSize": tick,
+                "stepSize": step,
+                "minQty": min_qty,
+                "marketStepSize": step_mkt,
+                "marketMinQty": min_qty_mkt,
+                "minNotional": min_notional,
+            }
+
 
     def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
         return self._symbol_filters.get(symbol, {"tickSize": 0.0, "stepSize": 0.0, "minQty": 0.0, "marketStepSize": 0.0, "marketMinQty": 0.0, "minNotional": 0.0})
@@ -427,16 +415,16 @@ def _parse_exchange_info(self, info: dict):
     async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
-async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float):
-    """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true. Keep params minimal for AsterDex."""
-    params = {
-        "symbol": symbol,
-        "side": side,              # BUY/SELL
-        "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
-        "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
-        "closePosition": "true",
-    }
-    return await self._signed("POST", "/fapi/v1/order", params)
+    async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float):
+        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true. Keep params minimal."""
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
+            "closePosition": "true",
+        }
+        return await self._signed("POST", "/fapi/v1/order", params)
 
     async def user_trades(self, symbol: str, start_time_ms: int | None = None,
                           end_time_ms: int | None = None, limit: int = 200):
@@ -456,7 +444,8 @@ async def place_conditional_close_all(self, symbol: str, side: str, order_type: 
             params["endTime"] = int(end_time_ms)
         return await self._signed("GET", "/fapi/v1/allOrders", params)
 
-async def position_risk(self, symbol: str):
+    async def position_risk(self, symbol: str):
+        """Get position risk for a symbol (tries v2 then v1)."""
         try:
             return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         except Exception:
@@ -743,23 +732,12 @@ class LiveEngine:
         self.api = api
         self.open_positions: Dict[str, dict] = {}  # symbol -> data
 
-
     async def reconcile_position(self, symbol: str) -> Optional[dict]:
-        """REST-authoritative sync of local open_positions with exchange positionRisk.
-
-        Must work even when WS is stale; logs REST failures instead of silently swallowing.
-        """
-        j = None
+        """Sync local open_positions with exchange positionRisk for symbol."""
         try:
             j = await self.api.position_risk(symbol)
-        except Exception as e:
-            print(f"[REST] position_risk failed for {symbol}: {e}")
-            try:
-                await self.api.sync_time(force=True)
-                j = await self.api.position_risk(symbol)
-            except Exception as e2:
-                print(f"[REST] position_risk retry failed for {symbol}: {e2}")
-                return self.open_positions.get(symbol)
+        except Exception:
+            return self.open_positions.get(symbol)
 
         pos = None
         if isinstance(j, list) and j:
@@ -772,24 +750,19 @@ class LiveEngine:
 
         amt = _csv_safe_float(pos.get("positionAmt"))
         entry = _csv_safe_float(pos.get("entryPrice"))
-        mark = _csv_safe_float(pos.get("markPrice"))
-
         if abs(amt) < 1e-12:
+            # no position on exchange
             self.open_positions.pop(symbol, None)
             return None
 
         side = "LONG" if amt > 0 else "SHORT"
-        prev = self.open_positions.get(symbol, {})
         self.open_positions[symbol] = {
             "symbol": symbol,
             "side": side,
             "qty": abs(amt),
-            "entry": entry if entry > 0 else prev.get("entry"),
-            "mark_price": mark if mark > 0 else prev.get("mark_price"),
-            "opened_ts": prev.get("opened_ts", time.time()),
-            "order_id_entry": prev.get("order_id_entry", ""),
-            "tp_order_id": prev.get("tp_order_id", ""),
-            "sl_order_id": prev.get("sl_order_id", ""),
+            "entry": entry if entry > 0 else None,
+            "opened_ts": self.open_positions.get(symbol, {}).get("opened_ts", time.time()),
+            "order_id_entry": self.open_positions.get(symbol, {}).get("order_id_entry", ""),
         }
         return self.open_positions[symbol]
 
@@ -807,8 +780,8 @@ class LiveEngine:
         qty = notional_effective / last_price
 
         f = self.api.get_symbol_filters(symbol)
-        step = float(f.get("marketStepSize", 0.0) or 0.0) or float(f.get("stepSize", 0.0) or 0.0)
-        min_qty = float(f.get("marketMinQty", 0.0) or 0.0) or float(f.get("minQty", 0.0) or 0.0)
+        step = float(f.get("marketStepSize", f.get("stepSize", 0.0)) or 0.0)
+        min_qty = float(f.get("marketMinQty", f.get("minQty", 0.0)) or 0.0)
 
         qty = _round_step(qty, step) if step > 0 else qty
         if qty < min_qty:
@@ -909,7 +882,7 @@ class LiveEngine:
 
         # apply step rounding
         f = self.api.get_symbol_filters(symbol)
-        step = float(f.get("marketStepSize", 0.0) or 0.0) or float(f.get("stepSize", 0.0) or 0.0)
+        step = float(f.get("marketStepSize", f.get("stepSize", 0.0)) or 0.0)
         qty = _round_step(qty, step) if step > 0 else qty
         if qty <= 0:
             raise RuntimeError("Rounded qty=0, cannot close.")
@@ -972,21 +945,16 @@ class LiveEngine:
         opened_ms = int(opened_ts * 1000)
 
         print(f"[WATCH] {symbol}: waiting for exchange to close the position... (tpOrder={tp_oid} slOrder={sl_oid})")
-        _last_wait_print = time.time()
 
         while not stop_event.is_set():
             await asyncio.sleep(self.cfg.WATCH_POLL_SEC)
 
             pos = await self.reconcile_position(symbol)
-            if not pos or float(pos.get("qty") or 0.0) == 0.0:
-                print(f"[WATCH] {symbol}: CLOSED on exchange (detected via REST). Running cleanup...")
+            if not pos:
+                # nothing on exchange -> treat as closed
                 break
-
-            if (time.time() - _last_wait_print) >= 60:
-                _last_wait_print = time.time()
-                qty_dbg = pos.get("qty")
-                mp_dbg = pos.get("mark_price") or pos.get("markPrice")
-                print(f"[WATCH] {symbol}: still open on exchange (qty={qty_dbg} mark={mp_dbg}). Waiting...")
+            if float(pos.get("qty") or 0.0) == 0.0:
+                break
 
             if self.cfg.WATCH_HARD_TIMEOUT_SEC > 0 and (time.time() - t0) >= self.cfg.WATCH_HARD_TIMEOUT_SEC:
                 if getattr(self.cfg, "EMERGENCY_CLOSE_ON_HARD_TIMEOUT", False):
