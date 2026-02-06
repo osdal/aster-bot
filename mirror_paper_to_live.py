@@ -1434,7 +1434,7 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
 async def main():
     cfg = Config.load()
     orch = Orchestrator(cfg)
-    if cfg.STARTUP_SELFTEST:
+    if getattr(cfg, 'STARTUP_SELFTEST', True):
         await startup_selftest(cfg, orch.api)
     _install_signal_handlers(asyncio.get_running_loop(), orch.stop_event)
     try:
