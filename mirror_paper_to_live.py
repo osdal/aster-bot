@@ -109,16 +109,17 @@ def _append_csv(path: str, header: List[str], row: Dict[str, object]) -> None:
         w.writerow({k: row.get(k, "") for k in header})
 
 def _round_step(x: float, step: float) -> float:
+    """Round quantity DOWN to the nearest stepSize."""
     if step <= 0:
-        return x
+        return float(x)
+    return math.floor(float(x) / float(step)) * float(step)
 
 def _round_tick(price: float, tick: float) -> float:
-    """Round price down to the nearest tick (safe for stopPrice filters)."""
+    """Round price DOWN to the nearest tickSize (safe for stopPrice filters)."""
     if tick <= 0:
         return float(price)
-    return math.floor(float(price) / tick) * tick
+    return math.floor(float(price) / float(tick)) * float(tick)
 
-    return math.floor(x / step) * step
 
 def _sign_hmac_sha256(secret: str, query_string: str) -> str:
     return hmac.new(secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -293,12 +294,29 @@ class Config:
 # =========================
 
 class AsterFapi:
+    """Minimal Binance-Futures-like REST wrapper for AsterDex FAPI endpoints."""
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
         # time sync cache
         self._time_offset_ms = 0
         self._time_sync_ts = 0.0
+
+        headers = {"X-MBX-APIKEY": cfg.ASTER_API_KEY} if cfg.ASTER_API_KEY else {}
+        self.client = httpx.AsyncClient(base_url=cfg.REST_BASE, timeout=20.0, headers=headers)
+
+        self._exchange_info = None
+        # per-symbol filters (we keep what we actually use)
+        self._symbol_filters: Dict[str, Dict[str, float]] = {}  # stepSize/minQty/minNotional/tickSize
+
+    async def close(self):
+        await self.client.aclose()
+
+    async def _public_get(self, path: str, params: dict | None = None):
+        r = await self.client.get(path, params=params)
+        r.raise_for_status()
+        return r.json()
 
     async def _ensure_time_offset(self, force: bool = False) -> None:
         """Sync local time with exchange server time for signed requests."""
@@ -318,50 +336,45 @@ class AsterFapi:
             # don't hard fail here; signed call will surface error
             print(f"[TIME] WARN: sync failed: {e}")
 
-        headers = {"X-MBX-APIKEY": cfg.ASTER_API_KEY} if cfg.ASTER_API_KEY else {}
-        self.client = httpx.AsyncClient(base_url=cfg.REST_BASE, timeout=20.0, headers=headers)
-
-        self._exchange_info = None
-        self._symbol_filters: Dict[str, Dict[str, float]] = {}  # stepSize/minQty/minNotional
-
-    async def close(self):
-        await self.client.aclose()
-
-    async def _public_get(self, path: str, params: dict | None = None):
-        r = await self.client.get(path, params=params)
-        r.raise_for_status()
-        return r.json()
-
     async def _signed(self, method: str, path: str, params: dict):
         # DRY RUN: do not send signed requests
         if self.cfg.DRY_RUN_LIVE:
             # minimal simulation for tests
-            if path.endswith('/order') and method.upper() == 'POST':
-                oid = str(int(time.time()*1000) % 10_000_000_000)
-                sym = params.get('symbol','')
-                if params.get('type') == 'MARKET' and params.get('quantity') is not None:
-                    qty = float(params.get('quantity'))
-                    side = params.get('side','')
+            if path.endswith("/order") and method.upper() == "POST":
+                oid = str(int(time.time() * 1000) % 10_000_000_000)
+                sym = params.get("symbol", "")
+                if params.get("type") == "MARKET" and params.get("quantity") is not None:
+                    qty = float(params.get("quantity"))
+                    side = params.get("side", "")
                     # store dry position
-                    if not hasattr(self, '_dry_positions'):
+                    if not hasattr(self, "_dry_positions"):
                         self._dry_positions = {}
-                    pos_amt = qty if side == 'BUY' else -qty
-                    self._dry_positions[sym] = {'symbol': sym, 'positionAmt': pos_amt, 'entryPrice': 0, 'unRealizedProfit': 0}
-                return {'orderId': oid, 'status': 'FILLED', 'executedQty': params.get('quantity','0'), 'avgPrice': params.get('price','0')}
-            return {'ok': True}
+                    pos_amt = qty if side == "BUY" else -qty
+                    self._dry_positions[sym] = {
+                        "symbol": sym,
+                        "positionAmt": pos_amt,
+                        "entryPrice": 0,
+                        "unRealizedProfit": 0,
+                    }
+                return {
+                    "orderId": oid,
+                    "status": "FILLED",
+                    "executedQty": params.get("quantity", "0"),
+                    "avgPrice": params.get("price", "0"),
+                }
+            return {"ok": True}
+
         # ensure time offset for signed requests
         await self._ensure_time_offset()
-        params = dict(params or {})
-        params['recvWindow'] = params.get('recvWindow', 5000)
-        params['timestamp'] = int(time.time() * 1000 + getattr(self, '_time_offset_ms', 0))
 
         if not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET:
             raise RuntimeError("LIVE enabled but ASTER_API_KEY/ASTER_API_SECRET not set.")
 
         params = dict(params or {})
-        params["timestamp"] = _now_ms()
+        params["recvWindow"] = int(params.get("recvWindow", 5000))
+        params["timestamp"] = int(time.time() * 1000 + int(getattr(self, "_time_offset_ms", 0)))
 
-        # build query string in a version-agnostic way (no httpx.QueryParams.encode issues)
+        # build query string
         qs = urlencode(params, doseq=True)
         sig = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
         params["signature"] = sig
@@ -383,25 +396,40 @@ class AsterFapi:
             sym = s.get("symbol")
             if not sym:
                 continue
-            filters = {f["filterType"]: f for f in s.get("filters", []) if isinstance(f, dict) and "filterType" in f}
+            filters = {
+                f["filterType"]: f
+                for f in s.get("filters", [])
+                if isinstance(f, dict) and "filterType" in f
+            }
             step = 0.0
             min_qty = 0.0
             min_notional = 0.0
+            tick = 0.0
+
             if "LOT_SIZE" in filters:
                 step = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
                 min_qty = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
+
+            # price tick
+            if "PRICE_FILTER" in filters:
+                tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
+
             if "MIN_NOTIONAL" in filters:
                 min_notional = _csv_safe_float(filters["MIN_NOTIONAL"].get("notional", 0))
             elif "NOTIONAL" in filters:
                 min_notional = _csv_safe_float(filters["NOTIONAL"].get("minNotional", 0))
+
             self._symbol_filters[sym] = {
-                "stepSize": step,
-                "minQty": min_qty,
-                "minNotional": min_notional,
+                "stepSize": float(step),
+                "minQty": float(min_qty),
+                "minNotional": float(min_notional),
+                "tickSize": float(tick),
             }
 
     def get_symbol_filters(self, symbol: str) -> Dict[str, float]:
-        return self._symbol_filters.get(symbol, {"stepSize": 0.0, "minQty": 0.0, "minNotional": 0.0})
+        return self._symbol_filters.get(
+            symbol, {"stepSize": 0.0, "minQty": 0.0, "minNotional": 0.0, "tickSize": 0.0}
+        )
 
     async def book_ticker(self, symbol: str) -> Tuple[float, float]:
         j = await self._public_get("/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
@@ -430,17 +458,23 @@ class AsterFapi:
             params["reduceOnly"] = "true"
         return await self._signed("POST", "/fapi/v1/order", params)
 
-    
     async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
-    async def place_conditional_close_all(self, symbol: str, side: str, order_type: str, stop_price: float,
-                                         working_type: str = "MARK_PRICE", price_protect: bool = True):
+    async def place_conditional_close_all(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        stop_price: float,
+        working_type: str = "MARK_PRICE",
+        price_protect: bool = True,
+    ):
         """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true (Close-All)."""
         params = {
             "symbol": symbol,
-            "side": side,              # BUY/SELL
-            "type": order_type,        # STOP_MARKET or TAKE_PROFIT_MARKET
+            "side": side,  # BUY/SELL
+            "type": order_type,  # STOP_MARKET or TAKE_PROFIT_MARKET
             "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
             "closePosition": "true",
             "workingType": working_type,
@@ -449,8 +483,13 @@ class AsterFapi:
             params["priceProtect"] = "TRUE"
         return await self._signed("POST", "/fapi/v1/order", params)
 
-    async def user_trades(self, symbol: str, start_time_ms: int | None = None,
-                          end_time_ms: int | None = None, limit: int = 200):
+    async def user_trades(
+        self,
+        symbol: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 200,
+    ):
         params = {"symbol": symbol, "limit": int(limit)}
         if start_time_ms is not None:
             params["startTime"] = int(start_time_ms)
@@ -458,8 +497,13 @@ class AsterFapi:
             params["endTime"] = int(end_time_ms)
         return await self._signed("GET", "/fapi/v1/userTrades", params)
 
-    async def all_orders(self, symbol: str, start_time_ms: int | None = None,
-                         end_time_ms: int | None = None, limit: int = 200):
+    async def all_orders(
+        self,
+        symbol: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 200,
+    ):
         params = {"symbol": symbol, "limit": int(limit)}
         if start_time_ms is not None:
             params["startTime"] = int(start_time_ms)
@@ -467,13 +511,12 @@ class AsterFapi:
             params["endTime"] = int(end_time_ms)
         return await self._signed("GET", "/fapi/v1/allOrders", params)
 
-async def position_risk(self, symbol: str):
+    async def position_risk(self, symbol: str):
+        """Wrapper for positionRisk. Tries v2 then v1."""
         try:
             return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         except Exception:
             return await self._signed("GET", "/fapi/v1/positionRisk", {"symbol": symbol})
-
-
 # =========================
 # Market data + indicators
 # =========================
@@ -748,6 +791,39 @@ class LiveEngine:
         "ts", "symbol", "side", "entry", "exit", "qty", "leverage",
         "pnl_pct", "net_pnl_usd", "outcome", "reason", "order_id_entry", "order_id_exit"
     ]
+
+    def _append_live_csv(
+        self,
+        ts: float,
+        symbol: str,
+        side: str,
+        entry: float,
+        exit_price: float,
+        qty: float,
+        leverage: int,
+        pnl_pct: float,
+        net_pnl_usd: float,
+        outcome: str,
+        reason: str,
+        order_id_entry: str,
+        order_id_exit: str,
+    ) -> None:
+        _append_csv(self.cfg.LIVE_LOG_PATH, self.LIVE_CSV_HEADER, {
+            'ts': _ts_iso(),
+            'symbol': symbol,
+            'side': side,
+            'entry': f\"{entry:.10f}\",
+            'exit': f\"{exit_price:.10f}\",
+            'qty': f\"{qty:.8f}\",
+            'leverage': str(int(leverage)),
+            'pnl_pct': f\"{pnl_pct:.6f}\",
+            'net_pnl_usd': f\"{net_pnl_usd:.10f}\",
+            'outcome': outcome,
+            'reason': reason,
+            'order_id_entry': order_id_entry,
+            'order_id_exit': order_id_exit,
+        })
+
 
     def __init__(self, cfg: Config, api: AsterFapi):
         self.cfg = cfg
