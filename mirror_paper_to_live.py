@@ -461,27 +461,38 @@ class AsterFapi:
     async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
-    async def place_conditional_close_all(
-        self,
-        symbol: str,
-        side: str,
-        order_type: str,
-        stop_price: float,
-        working_type: str = "MARK_PRICE",
-        price_protect: bool = True,
-    ):
-        """Place STOP_MARKET or TAKE_PROFIT_MARKET with closePosition=true (Close-All)."""
-        params = {
-            "symbol": symbol,
-            "side": side,  # BUY/SELL
-            "type": order_type,  # STOP_MARKET or TAKE_PROFIT_MARKET
-            "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
-            "closePosition": "true",
-            "workingType": working_type,
-        }
-        if price_protect:
-            params["priceProtect"] = "TRUE"
-        return await self._signed("POST", "/fapi/v1/order", params)
+    async def place_conditional_reduce_only(
+    self,
+    symbol: str,
+    side: str,
+    order_type: str,
+    stop_price: float,
+    quantity: float,
+    working_type: str = "MARK_PRICE",
+    price_protect: bool = True,
+    position_side: str = "BOTH",
+):
+    """Place STOP_MARKET / TAKE_PROFIT_MARKET as reduceOnly with explicit quantity.
+
+    Why: Some venues (including Aster Perp) may not honor `closePosition=true` the same way as Binance.
+    Using reduceOnly+quantity makes the order show up in UI and behave predictably.
+    """
+    params = {
+        "symbol": symbol,
+        "side": side,                 # SELL for closing LONG, BUY for closing SHORT
+        "type": order_type,           # STOP_MARKET or TAKE_PROFIT_MARKET
+        "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
+        "quantity": f"{quantity:.10f}".rstrip("0").rstrip("."),
+        "reduceOnly": "true",
+        "workingType": working_type,
+        "positionSide": position_side,  # BOTH unless you use hedge mode LONG/SHORT
+    }
+    if price_protect:
+        params["priceProtect"] = "TRUE"
+    return await self._signed("POST", "/fapi/v1/order", params)
+
+async def open_orders(self, symbol: str):
+    return await self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
 
     async def user_trades(
         self,
@@ -935,7 +946,7 @@ class LiveEngine:
 
         close_side = "SELL" if side == "LONG" else "BUY"
 
-        tp_res = await self.api.place_conditional_close_all(
+        tp_res = await self.api.place_conditional_reduce_only(
             symbol=symbol,
             side=close_side,
             order_type="TAKE_PROFIT_MARKET",
@@ -943,7 +954,7 @@ class LiveEngine:
             working_type="MARK_PRICE",
             price_protect=True,
         )
-        sl_res = await self.api.place_conditional_close_all(
+        sl_res = await self.api.place_conditional_reduce_only(
             symbol=symbol,
             side=close_side,
             order_type="STOP_MARKET",
