@@ -932,30 +932,32 @@ class LiveEngine:
         self.open_positions[symbol]["tp_px"] = tp_px
         self.open_positions[symbol]["sl_px"] = sl_px
 
-        print(f\"[LIVE] SL/TP placed on-exchange {symbol}: TP={tp_px:.4f} SL={sl_px:.4f} tpOrder={tp_order_id} slOrder={sl_order_id}\")
+        tp_order_id = str(self.open_positions[symbol].get("tp_order_id", ""))
+        sl_order_id = str(self.open_positions[symbol].get("sl_order_id", ""))
+        msg = (
+            f"[LIVE] SL/TP placed on-exchange {symbol}: "
+            f"TP={tp_px:.4f} SL={sl_px:.4f} "
+            f"tpOrder={tp_order_id} slOrder={sl_order_id}"
+        )
+        print(msg)
 
-        if getattr(self.cfg, 'VERIFY_SLTP_OPEN_ORDERS', True) and (not self.cfg.DRY_RUN_LIVE):
-
+        # Optional safety check: verify conditional orders are visible on the exchange
+        if getattr(self.cfg, "VERIFY_SLTP_OPEN_ORDERS", True) and (not self.cfg.DRY_RUN_LIVE):
             try:
-
-                oo = await self.fapi.open_orders(symbol)
-
-                cond = [o for o in (oo or []) if str(o.get('type','')).endswith('MARKET') and _csv_safe_float(o.get('stopPrice',0)) > 0]
-
+                oo = await self.api.open_orders(symbol)
+                cond = [
+                    o for o in (oo or [])
+                    if str(o.get("type", "")).endswith("MARKET") and _csv_safe_float(o.get("stopPrice", 0)) > 0
+                ]
                 if len(cond) < 2:
-
-                    print(f\"[LIVE] WARN: SL/TP not visible in openOrders (count={len(cond)}). Closing position for safety.\")
-
-                    close_side = 'SELL' if side.upper() == 'LONG' else 'BUY'
-
-                    await self.fapi.place_order(symbol, close_side, qty, reduce_only=True)
-
-                    raise RuntimeError('SLTP_NOT_CONFIRMED')
-
+                    print(f"[LIVE] WARN: SL/TP not visible in openOrders (count={len(cond)}). Closing position for safety.")
+                    close_side2 = "SELL" if side.upper() == "LONG" else "BUY"
+                    await self.api.place_order(symbol, close_side2, qty, reduce_only=True)
+                    raise RuntimeError("SLTP_NOT_CONFIRMED")
             except Exception as e:
-
-                print(f\"[LIVE] WARN: SL/TP verification failed: {e}\")
+                print(f"[LIVE] WARN: SL/TP verification failed: {e}")
         return self.open_positions[symbol]
+
 
     @staticmethod
     def _pnl_pct(side: str, entry: float, exit_price: float) -> float:
