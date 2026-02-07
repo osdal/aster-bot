@@ -379,9 +379,14 @@ class AsterFapi:
         sig = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
         params["signature"] = sig
 
-        r = await self.client.request(method, path, params=params)
-        r.raise_for_status()
-        return r.json()
+        
+r = await self.client.request(method, path, params=params)
+r.raise_for_status()
+j = r.json()
+# Some venues return HTTP 200 with an error code/message in JSON.
+if isinstance(j, dict) and ("code" in j) and str(j.get("code")) not in ("0", "200", "SUCCESS"):
+    raise RuntimeError(f"API error code={j.get('code')} msg={j.get('msg') or j.get('message') or j}")
+return j
 
     async def exchange_info(self):
         if self._exchange_info is None:
@@ -461,39 +466,54 @@ class AsterFapi:
     async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
-    async def place_conditional_close_all(
-        self,
-        symbol: str,
-        side: str,
-        order_type: str,
-        stop_price: float,
-        working_type: str = "MARK_PRICE",
-        price_protect: bool = True,
-        *,
-        quantity: float,
-        position_side: str = "BOTH",
-    ):
-        """Place STOP_MARKET / TAKE_PROFIT_MARKET as reduceOnly with explicit quantity.
-    
-        Notes:
-        - Some venues (including Aster Perp) may not honor `closePosition=true` the same way as Binance.
-        - Using reduceOnly + explicit quantity is safer and typically shows in UI under Open Orders.
-        """
-        params = {
-            "symbol": symbol,
-            "side": side,                 # SELL for closing LONG, BUY for closing SHORT
-            "type": order_type,           # STOP_MARKET or TAKE_PROFIT_MARKET
-            "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
-            "quantity": f"{quantity:.10f}".rstrip("0").rstrip("."),
-            "reduceOnly": "true",
-            "workingType": working_type,
-            "positionSide": position_side,  # BOTH unless hedge mode
-        }
-        if price_protect:
-            params["priceProtect"] = "TRUE"
-        return await self._signed("POST", "/fapi/v1/order", params)
-    
-    async def open_orders(self, symbol: str):
+async def place_conditional_close_all(
+    self,
+    symbol: str,
+    side: str,
+    order_type: str,
+    stop_price: float,
+    working_type: str = "MARK_PRICE",
+    price_protect: bool = True,
+    *,
+    quantity: float,
+    position_side: str = "BOTH",
+):
+    """Place STOP_MARKET / TAKE_PROFIT_MARKET as reduceOnly with explicit quantity.
+
+    Aster Perp may not honor `closePosition=true`. We therefore place reduceOnly orders with explicit quantity.
+    We also retry with `price` if the venue requires it for conditional orders.
+    """
+    # minimal payload first (more compatible)
+    base = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
+        "quantity": f"{quantity:.10f}".rstrip("0").rstrip("."),
+        "reduceOnly": "true",
+    }
+
+    # attempt 1: minimal
+    try:
+        return await self._signed("POST", "/fapi/v1/order", base)
+    except Exception as e1:
+        # attempt 2: add commonly-required fields
+        params2 = dict(base)
+        # some venues require `price` even for *_MARKET conditionals; use stop_price as a safe placeholder
+        params2["price"] = params2["stopPrice"]
+        params2["timeInForce"] = "GTC"
+        # keep these as optional; if the venue rejects unknown fields, omit them
+        # params2["workingType"] = working_type
+        # params2["positionSide"] = position_side
+        try:
+            return await self._signed("POST", "/fapi/v1/order", params2)
+        except Exception as e2:
+            raise RuntimeError(f"Failed to place conditional order (attempt1={e1}) (attempt2={e2})")
+
+async def open_orders(self, symbol: str):
+    return await self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
+
+    async def user_trades(self, symbol: str):
         return await self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
     
     async def user_trades(
