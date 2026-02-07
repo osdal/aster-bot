@@ -294,12 +294,10 @@ class Config:
 # =========================
 
 class AsterFapi:
-    """Minimal Binance-Futures-like REST wrapper for AsterDex FAPI endpoints."""
+    """Minimal Binance-Futures-like REST wrapper for AsterDex Perp (orderbook) endpoints."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-
-        # time sync cache
         self._time_offset_ms = 0
         self._time_sync_ts = 0.0
 
@@ -307,7 +305,6 @@ class AsterFapi:
         self.client = httpx.AsyncClient(base_url=cfg.REST_BASE, timeout=20.0, headers=headers)
 
         self._exchange_info = None
-        # per-symbol filters (we keep what we actually use)
         self._symbol_filters: Dict[str, Dict[str, float]] = {}  # stepSize/minQty/minNotional/tickSize
 
     async def close(self):
@@ -319,7 +316,6 @@ class AsterFapi:
         return r.json()
 
     async def _ensure_time_offset(self, force: bool = False) -> None:
-        """Sync local time with exchange server time for signed requests."""
         if self.cfg.DRY_RUN_LIVE:
             return
         now = time.time()
@@ -333,38 +329,15 @@ class AsterFapi:
             self._time_sync_ts = now
             print(f"[TIME] synced: offset_ms={self._time_offset_ms}")
         except Exception as e:
-            # don't hard fail here; signed call will surface error
             print(f"[TIME] WARN: sync failed: {e}")
 
     async def _signed(self, method: str, path: str, params: dict):
-        # DRY RUN: do not send signed requests
         if self.cfg.DRY_RUN_LIVE:
-            # minimal simulation for tests
             if path.endswith("/order") and method.upper() == "POST":
                 oid = str(int(time.time() * 1000) % 10_000_000_000)
-                sym = params.get("symbol", "")
-                if params.get("type") == "MARKET" and params.get("quantity") is not None:
-                    qty = float(params.get("quantity"))
-                    side = params.get("side", "")
-                    # store dry position
-                    if not hasattr(self, "_dry_positions"):
-                        self._dry_positions = {}
-                    pos_amt = qty if side == "BUY" else -qty
-                    self._dry_positions[sym] = {
-                        "symbol": sym,
-                        "positionAmt": pos_amt,
-                        "entryPrice": 0,
-                        "unRealizedProfit": 0,
-                    }
-                return {
-                    "orderId": oid,
-                    "status": "FILLED",
-                    "executedQty": params.get("quantity", "0"),
-                    "avgPrice": params.get("price", "0"),
-                }
+                return {"orderId": oid, "status": "FILLED"}
             return {"ok": True}
 
-        # ensure time offset for signed requests
         await self._ensure_time_offset()
 
         if not self.cfg.ASTER_API_KEY or not self.cfg.ASTER_API_SECRET:
@@ -374,19 +347,16 @@ class AsterFapi:
         params["recvWindow"] = int(params.get("recvWindow", 5000))
         params["timestamp"] = int(time.time() * 1000 + int(getattr(self, "_time_offset_ms", 0)))
 
-        # build query string
         qs = urlencode(params, doseq=True)
         sig = _sign_hmac_sha256(self.cfg.ASTER_API_SECRET, qs)
         params["signature"] = sig
 
-        
-r = await self.client.request(method, path, params=params)
-r.raise_for_status()
-j = r.json()
-# Some venues return HTTP 200 with an error code/message in JSON.
-if isinstance(j, dict) and ("code" in j) and str(j.get("code")) not in ("0", "200", "SUCCESS"):
-    raise RuntimeError(f"API error code={j.get('code')} msg={j.get('msg') or j.get('message') or j}")
-return j
+        r = await self.client.request(method, path, params=params)
+        r.raise_for_status()
+        j = r.json()
+        if isinstance(j, dict) and ("code" in j) and str(j.get("code")) not in ("0", "200", "SUCCESS"):
+            raise RuntimeError(f"API error code={j.get('code')} msg={j.get('msg') or j.get('message') or j}")
+        return j
 
     async def exchange_info(self):
         if self._exchange_info is None:
@@ -415,7 +385,6 @@ return j
                 step = _csv_safe_float(filters["LOT_SIZE"].get("stepSize", 0))
                 min_qty = _csv_safe_float(filters["LOT_SIZE"].get("minQty", 0))
 
-            # price tick
             if "PRICE_FILTER" in filters:
                 tick = _csv_safe_float(filters["PRICE_FILTER"].get("tickSize", 0))
 
@@ -455,7 +424,7 @@ return j
     async def place_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False):
         params = {
             "symbol": symbol,
-            "side": side,  # BUY/SELL
+            "side": side,
             "type": "MARKET",
             "quantity": f"{qty:.10f}".rstrip("0").rstrip("."),
         }
@@ -466,63 +435,43 @@ return j
     async def cancel_all_open_orders(self, symbol: str):
         return await self._signed("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
 
-async def place_conditional_close_all(
-    self,
-    symbol: str,
-    side: str,
-    order_type: str,
-    stop_price: float,
-    working_type: str = "MARK_PRICE",
-    price_protect: bool = True,
-    *,
-    quantity: float,
-    position_side: str = "BOTH",
-):
-    """Place STOP_MARKET / TAKE_PROFIT_MARKET as reduceOnly with explicit quantity.
-
-    Aster Perp may not honor `closePosition=true`. We therefore place reduceOnly orders with explicit quantity.
-    We also retry with `price` if the venue requires it for conditional orders.
-    """
-    # minimal payload first (more compatible)
-    base = {
-        "symbol": symbol,
-        "side": side,
-        "type": order_type,
-        "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
-        "quantity": f"{quantity:.10f}".rstrip("0").rstrip("."),
-        "reduceOnly": "true",
-    }
-
-    # attempt 1: minimal
-    try:
-        return await self._signed("POST", "/fapi/v1/order", base)
-    except Exception as e1:
-        # attempt 2: add commonly-required fields
-        params2 = dict(base)
-        # some venues require `price` even for *_MARKET conditionals; use stop_price as a safe placeholder
-        params2["price"] = params2["stopPrice"]
-        params2["timeInForce"] = "GTC"
-        # keep these as optional; if the venue rejects unknown fields, omit them
-        # params2["workingType"] = working_type
-        # params2["positionSide"] = position_side
-        try:
-            return await self._signed("POST", "/fapi/v1/order", params2)
-        except Exception as e2:
-            raise RuntimeError(f"Failed to place conditional order (attempt1={e1}) (attempt2={e2})")
-
-async def open_orders(self, symbol: str):
-    return await self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
-
-    async def user_trades(self, symbol: str):
+    async def open_orders(self, symbol: str):
         return await self._signed("GET", "/fapi/v1/openOrders", {"symbol": symbol})
-    
-    async def user_trades(
+
+    async def place_conditional_close_all(
         self,
         symbol: str,
-        start_time_ms: int | None = None,
-        end_time_ms: int | None = None,
-        limit: int = 200,
+        side: str,
+        order_type: str,
+        stop_price: float,
+        working_type: str = "MARK_PRICE",
+        price_protect: bool = True,
+        *,
+        quantity: float,
     ):
+        base = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "stopPrice": f"{stop_price:.10f}".rstrip("0").rstrip("."),
+            "quantity": f"{quantity:.10f}".rstrip("0").rstrip("."),
+            "reduceOnly": "true",
+        }
+        try:
+            return await self._signed("POST", "/fapi/v1/order", base)
+        except Exception as e1:
+            params2 = dict(base)
+            params2["price"] = params2["stopPrice"]
+            params2["timeInForce"] = "GTC"
+            params2["workingType"] = working_type
+            if price_protect:
+                params2["priceProtect"] = "TRUE"
+            try:
+                return await self._signed("POST", "/fapi/v1/order", params2)
+            except Exception as e2:
+                raise RuntimeError(f"Failed to place conditional order (attempt1={e1}) (attempt2={e2})")
+
+    async def user_trades(self, symbol: str, start_time_ms: int | None = None, end_time_ms: int | None = None, limit: int = 200):
         params = {"symbol": symbol, "limit": int(limit)}
         if start_time_ms is not None:
             params["startTime"] = int(start_time_ms)
@@ -530,13 +479,7 @@ async def open_orders(self, symbol: str):
             params["endTime"] = int(end_time_ms)
         return await self._signed("GET", "/fapi/v1/userTrades", params)
 
-    async def all_orders(
-        self,
-        symbol: str,
-        start_time_ms: int | None = None,
-        end_time_ms: int | None = None,
-        limit: int = 200,
-    ):
+    async def all_orders(self, symbol: str, start_time_ms: int | None = None, end_time_ms: int | None = None, limit: int = 200):
         params = {"symbol": symbol, "limit": int(limit)}
         if start_time_ms is not None:
             params["startTime"] = int(start_time_ms)
@@ -545,7 +488,6 @@ async def open_orders(self, symbol: str):
         return await self._signed("GET", "/fapi/v1/allOrders", params)
 
     async def position_risk(self, symbol: str):
-        """Wrapper for positionRisk. Tries v2 then v1."""
         try:
             return await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         except Exception:
@@ -990,9 +932,7 @@ class LiveEngine:
         self.open_positions[symbol]["tp_px"] = tp_px
         self.open_positions[symbol]["sl_px"] = sl_px
 
-        print(f"[LIVE] SL/TP placed on-exchange {symbol}: TP={tp_px:.4f} SL={sl_px:.4f} tpOrder={tp_order_id} slOrder={sl_order_id}")
-
-        # Verify that conditional orders are actually present on exchange
+        print(f\"[LIVE] SL/TP placed on-exchange {symbol}: TP={tp_px:.4f} SL={sl_px:.4f} tpOrder={tp_order_id} slOrder={sl_order_id}\")
 
         if getattr(self.cfg, 'VERIFY_SLTP_OPEN_ORDERS', True) and (not self.cfg.DRY_RUN_LIVE):
 
@@ -1000,13 +940,11 @@ class LiveEngine:
 
                 oo = await self.fapi.open_orders(symbol)
 
-                # keep only stop/tp market orders with stopPrice
-
                 cond = [o for o in (oo or []) if str(o.get('type','')).endswith('MARKET') and _csv_safe_float(o.get('stopPrice',0)) > 0]
 
                 if len(cond) < 2:
 
-                    print(f"[LIVE] WARN: SL/TP not visible in openOrders (count={len(cond)}). Closing position for safety.")
+                    print(f\"[LIVE] WARN: SL/TP not visible in openOrders (count={len(cond)}). Closing position for safety.\")
 
                     close_side = 'SELL' if side.upper() == 'LONG' else 'BUY'
 
@@ -1016,7 +954,7 @@ class LiveEngine:
 
             except Exception as e:
 
-                print(f"[LIVE] WARN: SL/TP verification failed: {e}")
+                print(f\"[LIVE] WARN: SL/TP verification failed: {e}\")
         return self.open_positions[symbol]
 
     @staticmethod
