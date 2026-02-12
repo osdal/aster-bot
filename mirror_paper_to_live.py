@@ -1,60 +1,87 @@
-﻿# ===============================
-# mirror_paper_to_live.py
-# Stable base version (PowerShell ENV compatible)
-# ===============================
-
+﻿# mirror_paper_to_live.py
+import asyncio
 import os
+from dotenv import load_dotenv
+import aiohttp
 import time
-import hmac
-import hashlib
-import requests
-import csv
-from datetime import datetime
 
-BASE = "https://fapi.asterdex.com"
-
+# Загружаем ключи из .env
+load_dotenv()
 API_KEY = os.getenv("ASTER_API_KEY")
 API_SECRET = os.getenv("ASTER_API_SECRET")
 
-if not API_KEY or not API_SECRET:
-    raise RuntimeError("ASTER_API_KEY / ASTER_API_SECRET not found in ENV")
+# Настройки бота
+SYMBOL = "BTCUSDT"  # Пример пары
+POSITION_SIZE = 0.01  # Размер позиции
+TP_PERCENT = 0.6 / 100  # 0.6% Take Profit
+SL_PERCENT = 0.2 / 100  # 0.2% Stop Loss
+POLL_INTERVAL = 2  # Интервал проверки позиции в секундах
 
-HEADERS = {"X-MBX-APIKEY": API_KEY}
+class AsterDexClient:
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = "https://api.asterdex.com"  # пример
 
-TP_PCT = 0.006
-SL_PCT = 0.002
-LIVE_MAX_POSITIONS = 1
+    async def place_order(self, symbol, side, quantity, price=None, order_type="MARKET"):
+        # Отправка ордера
+        async with aiohttp.ClientSession() as session:
+            url = f"{self.base_url}/v1/order"
+            data = {
+                "symbol": symbol,
+                "side": side,
+                "type": order_type,
+                "quantity": quantity,
+            }
+            if price:
+                data["price"] = price
+            headers = {"X-API-KEY": self.api_key}
+            async with session.post(url, json=data, headers=headers) as resp:
+                return await resp.json()
 
-os.makedirs("data", exist_ok=True)
-CSV_FILE = "data/live_trades.csv"
+    async def place_tp_sl(self, symbol, side, entry_price, quantity):
+        # Рассчитываем цены TP и SL
+        if side == "BUY":
+            tp_price = entry_price * (1 + TP_PERCENT)
+            sl_price = entry_price * (1 - SL_PERCENT)
+        else:
+            tp_price = entry_price * (1 - TP_PERCENT)
+            sl_price = entry_price * (1 + SL_PERCENT)
 
-live_positions = {}
+        # Выставляем ордера Take Profit и Stop Loss
+        print(f"Placing TP at {tp_price:.2f} and SL at {sl_price:.2f}")
+        await self.place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=tp_price, order_type="LIMIT")
+        await self.place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=sl_price, order_type="STOP")
 
-# ---------- signing ----------
+    async def get_open_positions(self):
+        async with aiohttp.ClientSession() as session:
+            url = f"{self.base_url}/v1/positions"
+            headers = {"X-API-KEY": self.api_key}
+            async with session.get(url, headers=headers) as resp:
+                return await resp.json()
 
-def sign(params: dict):
-    query = "&".join(f"{k}={params[k]}" for k in params)
-    sig = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    return query + "&signature=" + sig
+async def monitor_position(client, symbol):
+    while True:
+        positions = await client.get_open_positions()
+        if not positions:
+            print(f"Position for {symbol} closed")
+            break
+        await asyncio.sleep(POLL_INTERVAL)
 
+async def main():
+    client = AsterDexClient(API_KEY, API_SECRET)
 
-def post(path, params):
-    params["timestamp"] = int(time.time() * 1000)
-    url = BASE + path + "?" + sign(params)
+    # Пример открытия позиции
+    side = "BUY"
+    quantity = POSITION_SIZE
+    order_resp = await client.place_order(SYMBOL, side, quantity)
+    print(f"Order response: {order_resp}")
 
-    r = requests.post(url, headers=HEADERS)
-    if r.status_code != 200:
-        raise RuntimeError(f"{r.status_code} {r.text}")
-    return r.json()
+    entry_price = float(order_resp.get("price", 0)) or 50000  # fallback цена
+    await client.place_tp_sl(SYMBOL, side, entry_price, quantity)
 
+    # Мониторим позицию до закрытия
+    await monitor_position(client, SYMBOL)
 
-# ---------- exchange ----------
-
-def open_market(symbol, side, qty):
-    print(f"[LIVE] ENTRY {symbol} {side} qty={qty}")
-
-    return post("/fapi/v1/order", {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "quan
+if __name__ == "__main__":
+    asyncio.run(main())
