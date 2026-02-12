@@ -1,4 +1,4 @@
-﻿# mirror_paper_to_live_real.py
+﻿# mirror_paper_to_live_env.py
 import os
 import time
 import hmac
@@ -7,26 +7,33 @@ import requests
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 
-# Загрузка ключей из .env
+# Загрузка переменных из .env
 load_dotenv()
 API_KEY = os.getenv("ASTER_API_KEY")
 API_SECRET = os.getenv("ASTER_API_SECRET")
-
-BASE_URL = "https://fapi.asterdex.com"
+BASE_URL = os.getenv("ASTER_REST_BASE", "https://fapi.asterdex.com")
 
 SYMBOL = "XRPUSDT"
-POSITION_SIZE = 100  # пример: 100 XRP
-LEVERAGE = 2
-TP_PERCENT = 0.006  # 0.6%
-SL_PERCENT = 0.002  # 0.2%
-POLL_INTERVAL = 2  # сек
+QUOTE = os.getenv("QUOTE", "USDT")
+LIVE_NOTIONAL_USD = float(os.getenv("LIVE_NOTIONAL_USD", 5))
+LEVERAGE = int(os.getenv("LIVE_LEVERAGE", 2))
+TP_PCT = float(os.getenv("TP_PCT", 0.8)) / 100  # 0.8% -> 0.008
+SL_PCT = float(os.getenv("SL_PCT", 0.2)) / 100  # 0.2% -> 0.002
+POLL_INTERVAL = int(os.getenv("WATCH_POLL_SEC", 2))
 
 def sign_request(params, secret):
     query_string = urlencode(params)
     signature = hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
     return signature
 
-def place_order(symbol, side, quantity, price=None, order_type="MARKET"):
+def get_current_price(symbol):
+    url = f"{BASE_URL}/fapi/v1/ticker/price"
+    params = {"symbol": symbol}
+    resp = requests.get(url, params=params)
+    data = resp.json()
+    return float(data["price"])
+
+def place_order(symbol, side, quantity, price=None, order_type="MARKET", timeInForce=None):
     url = f"{BASE_URL}/fapi/v1/order"
     params = {
         "symbol": symbol,
@@ -39,6 +46,8 @@ def place_order(symbol, side, quantity, price=None, order_type="MARKET"):
     }
     if price:
         params["price"] = price
+    if timeInForce:
+        params["timeInForce"] = timeInForce
     params["signature"] = sign_request(params, API_SECRET)
     headers = {"X-MBX-APIKEY": API_KEY}
     resp = requests.post(url, params=params, headers=headers)
@@ -68,16 +77,16 @@ def get_open_positions():
 
 def place_tp_sl(symbol, side, entry_price, quantity):
     if side == "BUY":
-        tp_price = round(entry_price * (1 + TP_PERCENT), 5)
-        sl_price = round(entry_price * (1 - SL_PERCENT), 5)
+        tp_price = round(entry_price * (1 + TP_PCT), 5)
+        sl_price = round(entry_price * (1 - SL_PCT), 5)
     else:
-        tp_price = round(entry_price * (1 - TP_PERCENT), 5)
-        sl_price = round(entry_price * (1 + SL_PERCENT), 5)
+        tp_price = round(entry_price * (1 - TP_PCT), 5)
+        sl_price = round(entry_price * (1 + SL_PCT), 5)
     print(f"Placing TP at {tp_price}, SL at {sl_price}")
-    # Take Profit
-    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=tp_price, order_type="LIMIT")
-    # Stop Loss
-    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=sl_price, order_type="STOP")
+    # Take Profit (LIMIT)
+    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=tp_price, order_type="LIMIT", timeInForce="GTC")
+    # Stop Loss (STOP)
+    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=sl_price, order_type="STOP", timeInForce="GTC")
 
 def monitor_position(symbol):
     while True:
@@ -90,9 +99,11 @@ def monitor_position(symbol):
 
 def main():
     side = "BUY"  # или "SELL"
-    quantity = POSITION_SIZE
+    current_price = get_current_price(SYMBOL)
+    quantity = round(LIVE_NOTIONAL_USD / current_price * LEVERAGE, 4)  # вычисляем размер позиции по USD и плечу
+    print(f"Opening {side} position for {quantity} {SYMBOL} at market price {current_price}")
     order_resp = place_order(SYMBOL, side, quantity)
-    entry_price = float(order_resp.get("price", 0)) or 0.5  # fallback
+    entry_price = float(order_resp.get("avgFillPrice") or current_price)
     place_tp_sl(SYMBOL, side, entry_price, quantity)
     monitor_position(SYMBOL)
 
