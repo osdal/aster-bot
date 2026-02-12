@@ -1,69 +1,60 @@
-﻿
-# mirror_paper_to_live_FINAL.py
-# Patched stop logic using reduceOnly + quantity
+﻿# ===============================
+# mirror_paper_to_live.py
+# Stable base version (PowerShell ENV compatible)
+# ===============================
 
+import os
 import time
 import hmac
 import hashlib
 import requests
-from urllib.parse import urlencode
+import csv
+from datetime import datetime
 
-API_KEY = "PUT_KEY"
-API_SECRET = "PUT_SECRET"
 BASE = "https://fapi.asterdex.com"
 
-session = requests.Session()
-session.headers.update({"X-MBX-APIKEY": API_KEY})
+API_KEY = os.getenv("ASTER_API_KEY")
+API_SECRET = os.getenv("ASTER_API_SECRET")
 
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("ASTER_API_KEY / ASTER_API_SECRET not found in ENV")
 
-def sign(params):
-    q = urlencode(params)
-    sig = hmac.new(API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
-    return q + "&signature=" + sig
+HEADERS = {"X-MBX-APIKEY": API_KEY}
+
+TP_PCT = 0.006
+SL_PCT = 0.002
+LIVE_MAX_POSITIONS = 1
+
+os.makedirs("data", exist_ok=True)
+CSV_FILE = "data/live_trades.csv"
+
+live_positions = {}
+
+# ---------- signing ----------
+
+def sign(params: dict):
+    query = "&".join(f"{k}={params[k]}" for k in params)
+    sig = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return query + "&signature=" + sig
 
 
 def post(path, params):
     params["timestamp"] = int(time.time() * 1000)
     url = BASE + path + "?" + sign(params)
-    r = session.post(url)
+
+    r = requests.post(url, headers=HEADERS)
     if r.status_code != 200:
         raise RuntimeError(f"{r.status_code} {r.text}")
     return r.json()
 
 
+# ---------- exchange ----------
+
 def open_market(symbol, side, qty):
+    print(f"[LIVE] ENTRY {symbol} {side} qty={qty}")
+
     return post("/fapi/v1/order", {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "quantity": qty
-    })
-
-
-def place_stop(symbol, exit_side, qty, stop_price, typ):
-    return post("/fapi/v1/order", {
-        "symbol": symbol,
-        "side": exit_side,
-        "type": typ,
-        "stopPrice": stop_price,
-        "quantity": qty,
-        "reduceOnly": "true",
-        "workingType": "MARK_PRICE"
-    })
-
-
-def open_with_stops(symbol, side, qty, tp, sl):
-    print("OPEN", symbol, side, qty)
-    open_market(symbol, side, qty)
-
-    exit_side = "SELL" if side == "BUY" else "BUY"
-
-    print("SL")
-    place_stop(symbol, exit_side, qty, sl, "STOP_MARKET")
-
-    print("TP")
-    place_stop(symbol, exit_side, qty, tp, "TAKE_PROFIT_MARKET")
-
-
-if __name__ == "__main__":
-    open_with_stops("ASTERUSDT", "BUY", 10, 0.66, 0.64)
+        "quan
