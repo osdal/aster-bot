@@ -1,4 +1,4 @@
-﻿# mirror_paper_to_live_env.py
+﻿# mirror_paper_to_live_fixed.py
 import os
 import time
 import hmac
@@ -28,10 +28,22 @@ def sign_request(params, secret):
 
 def get_current_price(symbol):
     url = f"{BASE_URL}/fapi/v1/ticker/price"
-    params = {"symbol": symbol}
-    resp = requests.get(url, params=params)
+    resp = requests.get(url, params={"symbol": symbol})
     data = resp.json()
     return float(data["price"])
+
+def get_available_balance():
+    url = f"{BASE_URL}/fapi/v2/balance"
+    params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+    params["signature"] = sign_request(params, API_SECRET)
+    headers = {"X-MBX-APIKEY": API_KEY}
+    resp = requests.get(url, params=params, headers=headers)
+    data = resp.json()
+    # Ищем баланс в QUOTE
+    for b in data:
+        if b["asset"] == QUOTE:
+            return float(b["availableBalance"])
+    return 0
 
 def place_order(symbol, side, quantity, price=None, order_type="MARKET", timeInForce=None):
     url = f"{BASE_URL}/fapi/v1/order"
@@ -61,10 +73,7 @@ def place_order(symbol, side, quantity, price=None, order_type="MARKET", timeInF
 
 def get_open_positions():
     url = f"{BASE_URL}/fapi/v2/positionRisk"
-    params = {
-        "timestamp": int(time.time() * 1000),
-        "recvWindow": 5000
-    }
+    params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
     params["signature"] = sign_request(params, API_SECRET)
     headers = {"X-MBX-APIKEY": API_KEY}
     resp = requests.get(url, params=params, headers=headers)
@@ -84,9 +93,11 @@ def place_tp_sl(symbol, side, entry_price, quantity):
         sl_price = round(entry_price * (1 + SL_PCT), 5)
     print(f"Placing TP at {tp_price}, SL at {sl_price}")
     # Take Profit (LIMIT)
-    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=tp_price, order_type="LIMIT", timeInForce="GTC")
+    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity,
+                price=tp_price, order_type="LIMIT", timeInForce="GTC")
     # Stop Loss (STOP)
-    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity, price=sl_price, order_type="STOP", timeInForce="GTC")
+    place_order(symbol, "SELL" if side=="BUY" else "BUY", quantity,
+                price=sl_price, order_type="STOP", timeInForce="GTC")
 
 def monitor_position(symbol):
     while True:
@@ -100,9 +111,17 @@ def monitor_position(symbol):
 def main():
     side = "BUY"  # или "SELL"
     current_price = get_current_price(SYMBOL)
-    quantity = round(LIVE_NOTIONAL_USD / current_price * LEVERAGE, 4)  # вычисляем размер позиции по USD и плечу
+    # Вычисляем размер позиции исходя из баланса
+    available_balance = get_available_balance()
+    max_position_usd = min(LIVE_NOTIONAL_USD, available_balance * LEVERAGE)
+    quantity = round(max_position_usd / current_price, 4)
+    if quantity <= 0:
+        print("Недостаточно средств для открытия позиции")
+        return
+
     print(f"Opening {side} position for {quantity} {SYMBOL} at market price {current_price}")
     order_resp = place_order(SYMBOL, side, quantity)
+    # Берём реальную цену открытия
     entry_price = float(order_resp.get("avgFillPrice") or current_price)
     place_tp_sl(SYMBOL, side, entry_price, quantity)
     monitor_position(SYMBOL)
