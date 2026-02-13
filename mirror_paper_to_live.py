@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 # ========= LOAD ENV =========
 load_dotenv()
+print("MY VERSION LOADED 777")
 
 BASE = os.getenv("ASTER_REST_BASE")
 KEY = os.getenv("ASTER_API_KEY")
