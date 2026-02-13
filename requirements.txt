@@ -3,3 +3,6 @@ requests==2.32.3
 websocket-client==1.8.0
 websockets==12.0
 httpx==0.27.0
+pandas=3.0.0
+numpy
+python-dotenv
