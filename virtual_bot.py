@@ -22,6 +22,11 @@ TIMEFRAME = os.getenv("TIMEFRAME", "1m")
 # ===== FILTER SWITCHES =====
 ENABLE_ATR_FILTER = os.getenv("ENABLE_ATR_FILTER", "1") == "1"
 ENABLE_SLOPE_FILTER = os.getenv("ENABLE_SLOPE_FILTER", "1") == "1"
+ENABLE_COOLDOWN = os.getenv("ENABLE_COOLDOWN", "1") == "1"
+
+# ===== COOLDOWN SETTINGS =====
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "30"))
+last_trade_time = 0
 
 # ===== ATR SETTINGS =====
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
@@ -127,6 +132,14 @@ print("=== VIRTUAL BOT STARTED ===")
 
 while True:
 
+    # ----- COOLDOWN -----
+    if ENABLE_COOLDOWN:
+        elapsed = time.time() - last_trade_time
+        if elapsed < COOLDOWN_SEC:
+            print(f"COOLDOWN {int(COOLDOWN_SEC-elapsed)}s remaining")
+            time.sleep(1)
+            continue
+
     price = get_price()
 
     # ----- ATR FILTER -----
@@ -174,19 +187,23 @@ while True:
             if current >= tp:
                 print("TP HIT\n")
                 record_trade(price,tp,sl,side,trend,"TP",current)
+                last_trade_time = time.time()
                 break
             if current <= sl:
                 print("SL HIT\n")
                 record_trade(price,tp,sl,side,trend,"SL",current)
+                last_trade_time = time.time()
                 break
         else:
             if current <= tp:
                 print("TP HIT\n")
                 record_trade(price,tp,sl,side,trend,"TP",current)
+                last_trade_time = time.time()
                 break
             if current >= sl:
                 print("SL HIT\n")
                 record_trade(price,tp,sl,side,trend,"SL",current)
+                last_trade_time = time.time()
                 break
 
         time.sleep(1)
