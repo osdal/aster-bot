@@ -7,7 +7,6 @@ import numpy as np
 from datetime import datetime
 from dotenv import load_dotenv
 
-# ========= LOAD ENV =========
 load_dotenv()
 
 BASE = os.getenv("ASTER_REST_BASE")
@@ -24,24 +23,27 @@ ENABLE_ATR_FILTER = os.getenv("ENABLE_ATR_FILTER", "1") == "1"
 ENABLE_SLOPE_FILTER = os.getenv("ENABLE_SLOPE_FILTER", "1") == "1"
 ENABLE_COOLDOWN = os.getenv("ENABLE_COOLDOWN", "1") == "1"
 
-# ===== COOLDOWN SETTINGS =====
+# ===== EQUITY =====
+equity = float(os.getenv("START_EQUITY", "1000"))
+
+# ===== COOLDOWN =====
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "30"))
 last_trade_time = 0
 
-# ===== ATR SETTINGS =====
+# ===== ATR =====
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.0015"))
 KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "100"))
 
-# ===== EMA SETTINGS =====
+# ===== EMA =====
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
 
-# ===== SLOPE SETTINGS =====
+# ===== SLOPE =====
 SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "3"))
 SLOPE_THRESHOLD = float(os.getenv("SLOPE_THRESHOLD", "0.0003"))
 
-# ===== FILE PATH =====
+# ===== FILE =====
 DATA_DIR = "data"
 CSV_FILE = os.path.join(DATA_DIR, "trades.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -67,11 +69,9 @@ def ema(values, period):
     a[:period] = a[period]
     return a
 
-# ========= SLOPE =========
 def ema_slope(series):
     return series[-1] - series[-SLOPE_LOOKBACK]
 
-# ========= TREND =========
 def get_trend_and_slope():
     kl = get_klines()
     closes = np.array([float(x[4]) for x in kl])
@@ -108,102 +108,87 @@ if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "timestamp","symbol","side","trend",
-            "entry","tp","sl","result","exit"
+            "timestamp","symbol","side","entry","exit",
+            "result","pnl","equity"
         ])
 
-def record_trade(entry,tp,sl,side,trend,result,exit_price):
+def record_trade(side,entry,exit_price,result,pnl,equity):
     with open(CSV_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             datetime.now(),
             SYMBOL,
             side,
-            trend,
             entry,
-            tp,
-            sl,
+            exit_price,
             result,
-            exit_price
+            pnl,
+            equity
         ])
 
-# ========= MAIN LOOP =========
+# ========= MAIN =========
 print("=== VIRTUAL BOT STARTED ===")
+print(f"START EQUITY: {equity}")
 
 while True:
 
-    # ----- COOLDOWN -----
     if ENABLE_COOLDOWN:
         elapsed = time.time() - last_trade_time
         if elapsed < COOLDOWN_SEC:
-            print(f"COOLDOWN {int(COOLDOWN_SEC-elapsed)}s remaining")
+            print(f"COOLDOWN {int(COOLDOWN_SEC-elapsed)}s")
             time.sleep(1)
             continue
 
     price = get_price()
 
-    # ----- ATR FILTER -----
     if ENABLE_ATR_FILTER:
         atr = get_atr()
-        volatility = atr / price
-
-        print(f"ATR={atr:.6f} VOL={volatility:.6f}")
-
-        if volatility < ATR_THRESHOLD:
-            print("SKIP — low volatility\n")
+        if atr / price < ATR_THRESHOLD:
             time.sleep(2)
             continue
 
-    # ----- TREND + SLOPE -----
     trend, slope = get_trend_and_slope()
 
     if ENABLE_SLOPE_FILTER:
-        slope_ratio = abs(slope) / price
-        print(f"SLOPE={slope_ratio:.6f}")
-
-        if slope_ratio < SLOPE_THRESHOLD:
-            print("SKIP — flat slope\n")
+        if abs(slope)/price < SLOPE_THRESHOLD:
             time.sleep(2)
             continue
 
     side = "BUY" if trend == "UPTREND" else "SELL"
     qty = math.floor((NOTIONAL / price) * 10) / 10
 
-    if side == "BUY":
-        tp = price * (1 + TP_PCT)
-        sl = price * (1 - SL_PCT)
-    else:
-        tp = price * (1 - TP_PCT)
-        sl = price * (1 + SL_PCT)
+    tp = price*(1+TP_PCT) if side=="BUY" else price*(1-TP_PCT)
+    sl = price*(1-SL_PCT) if side=="BUY" else price*(1+SL_PCT)
 
-    print(f"\nOPEN {side} {qty} @ {price}")
-    print(f"TP={tp} SL={sl} TREND={trend}")
+    entry = price
+    print(f"OPEN {side} @ {entry}")
 
-    # ----- MONITOR -----
     while True:
         current = get_price()
 
-        if side == "BUY":
-            if current >= tp:
-                print("TP HIT\n")
-                record_trade(price,tp,sl,side,trend,"TP",current)
-                last_trade_time = time.time()
-                break
-            if current <= sl:
-                print("SL HIT\n")
-                record_trade(price,tp,sl,side,trend,"SL",current)
-                last_trade_time = time.time()
-                break
+        hit=False
+        if side=="BUY":
+            hit = current>=tp or current<=sl
         else:
-            if current <= tp:
-                print("TP HIT\n")
-                record_trade(price,tp,sl,side,trend,"TP",current)
-                last_trade_time = time.time()
-                break
-            if current >= sl:
-                print("SL HIT\n")
-                record_trade(price,tp,sl,side,trend,"SL",current)
-                last_trade_time = time.time()
-                break
+            hit = current<=tp or current>=sl
+
+        if hit:
+            exit_price=current
+            change=(exit_price-entry)/entry
+            pnl=change*NOTIONAL
+            if side=="SELL":
+                pnl*=-1
+
+            equity+=pnl
+            result="TP" if (
+                (side=="BUY" and exit_price>=tp) or
+                (side=="SELL" and exit_price<=tp)
+            ) else "SL"
+
+            print(f"{result} | PnL={pnl:.4f} | EQUITY={equity:.2f}")
+
+            record_trade(side,entry,exit_price,result,pnl,equity)
+            last_trade_time=time.time()
+            break
 
         time.sleep(1)
