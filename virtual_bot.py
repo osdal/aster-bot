@@ -17,14 +17,24 @@ NOTIONAL = float(os.getenv("LIVE_NOTIONAL_USD", "5"))
 TP_PCT = float(os.getenv("TP_PCT", "1.0")) / 100
 SL_PCT = float(os.getenv("SL_PCT", "0.8")) / 100
 
-# ===== ATR FILTER SETTINGS =====
-ATR_PERIOD = 14
-ATR_THRESHOLD = 0.0015
-KLINES_LIMIT = 100
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")
+
+# ===== FILTER SWITCHES =====
+ENABLE_ATR_FILTER = os.getenv("ENABLE_ATR_FILTER", "1") == "1"
+ENABLE_SLOPE_FILTER = os.getenv("ENABLE_SLOPE_FILTER", "1") == "1"
+
+# ===== ATR SETTINGS =====
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.0015"))
+KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "100"))
 
 # ===== EMA SETTINGS =====
-EMA_FAST = 9
-EMA_SLOW = 21
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
+
+# ===== SLOPE SETTINGS =====
+SLOPE_LOOKBACK = int(os.getenv("SLOPE_LOOKBACK", "3"))
+SLOPE_THRESHOLD = float(os.getenv("SLOPE_THRESHOLD", "0.0003"))
 
 # ===== FILE PATH =====
 DATA_DIR = "data"
@@ -41,7 +51,7 @@ def get_price():
 
 def get_klines():
     return public_get(
-        f"/fapi/v1/klines?symbol={SYMBOL}&interval=1m&limit={KLINES_LIMIT}"
+        f"/fapi/v1/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit={KLINES_LIMIT}"
     )
 
 # ========= EMA =========
@@ -52,15 +62,22 @@ def ema(values, period):
     a[:period] = a[period]
     return a
 
+# ========= SLOPE =========
+def ema_slope(series):
+    return series[-1] - series[-SLOPE_LOOKBACK]
+
 # ========= TREND =========
-def get_trend():
+def get_trend_and_slope():
     kl = get_klines()
     closes = np.array([float(x[4]) for x in kl])
 
     fast = ema(closes, EMA_FAST)
     slow = ema(closes, EMA_SLOW)
 
-    return "UPTREND" if fast[-1] > slow[-1] else "DOWNTREND"
+    slope = ema_slope(fast)
+    trend = "UPTREND" if fast[-1] > slow[-1] else "DOWNTREND"
+
+    return trend, slope
 
 # ========= ATR =========
 def get_atr():
@@ -113,20 +130,30 @@ while True:
     price = get_price()
 
     # ----- ATR FILTER -----
-    atr = get_atr()
-    volatility = atr / price
+    if ENABLE_ATR_FILTER:
+        atr = get_atr()
+        volatility = atr / price
 
-    print(f"ATR={atr:.6f}  VOL={volatility:.6f}")
+        print(f"ATR={atr:.6f} VOL={volatility:.6f}")
 
-    if volatility < ATR_THRESHOLD:
-        print("SKIP — low volatility\n")
-        time.sleep(2)
-        continue
+        if volatility < ATR_THRESHOLD:
+            print("SKIP — low volatility\n")
+            time.sleep(2)
+            continue
 
-    # ----- TREND -----
-    trend = get_trend()
+    # ----- TREND + SLOPE -----
+    trend, slope = get_trend_and_slope()
+
+    if ENABLE_SLOPE_FILTER:
+        slope_ratio = abs(slope) / price
+        print(f"SLOPE={slope_ratio:.6f}")
+
+        if slope_ratio < SLOPE_THRESHOLD:
+            print("SKIP — flat slope\n")
+            time.sleep(2)
+            continue
+
     side = "BUY" if trend == "UPTREND" else "SELL"
-
     qty = math.floor((NOTIONAL / price) * 10) / 10
 
     if side == "BUY":
@@ -152,7 +179,6 @@ while True:
                 print("SL HIT\n")
                 record_trade(price,tp,sl,side,trend,"SL",current)
                 break
-
         else:
             if current <= tp:
                 print("TP HIT\n")
