@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 
 
 # ========= LOAD ENV =========
-load_dotenv()
+load_dotenv(os.getenv("DOTENV_CONFIG_PATH", ".env"))
+
 
 BASE = os.getenv("ASTER_REST_BASE")
 SYMBOL = os.getenv("LIVE_SYMBOL", "XRPUSDT")
