@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv(os.getenv("DOTENV_CONFIG_PATH", ".env"))
 
 BASE = os.getenv("ASTER_REST_BASE")
-SYMBOLS = os.getenv("LIVE_SYMBOL", "XRPUSDT").split(",")
+SYMBOLS = os.getenv("LIVE_SYMBOL", "SOLUSDT").split(",")  # несколько символов через запятую
 NOTIONAL = float(os.getenv("LIVE_NOTIONAL_USD", "5"))
 
 TP_PCT = float(os.getenv("TP_PCT", "1.0")) / 100
@@ -52,7 +52,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ========= HELPERS =========
 def log(msg):
     if VERBOSE:
-        print(f"{datetime.now()} | {msg}", flush=True)
+        print(msg)
 
 def public_get(path):
     return requests.get(BASE + path).json()
@@ -147,33 +147,31 @@ while True:
 
     for sym in SYMBOLS:
         price = get_price(sym)
-
-        if ENABLE_COOLDOWN and not TEST_MODE:
-            if now - last_trade_time[sym] < COOLDOWN_SEC:
-                log(f"{sym}: SKIP — cooldown")
-                continue
-
         atr = get_atr(sym)
         volatility = atr/price
-
         trend, slope = get_trend_and_slope(sym)
         slope_ratio = abs(slope)/price
 
-        # ========= FILTERS =========
-        reasons = []
-        if ENABLE_ATR_FILTER and not TEST_MODE and volatility < ATR_THRESHOLD:
-            reasons.append(f"ATR={volatility:.6f} < TH={ATR_THRESHOLD}")
+        # Логируем все проверки
+        msg = f"{datetime.now()} | {sym}: PRICE={price:.2f}, ATR={atr:.6f}, VOL={volatility:.6f}, SLOPE={slope_ratio:.8f}, TREND={trend}"
+        print(msg)
 
-        if ENABLE_SLOPE_FILTER and not TEST_MODE and slope_ratio < SLOPE_THRESHOLD:
-            reasons.append(f"SLOPE={slope_ratio:.8f} < TH={SLOPE_THRESHOLD}")
-
-        if reasons:
-            log(f"{sym}: SIGNAL BLOCKED -> " + " | ".join(reasons))
+        # Проверка cooldown
+        if ENABLE_COOLDOWN and not TEST_MODE and now - last_trade_time[sym] < COOLDOWN_SEC:
+            print(f"{sym}: SIGNAL BLOCKED -> cooldown active ({now-last_trade_time[sym]:.1f}s)")
             continue
-        else:
-            log(f"{sym}: SIGNAL PASSED | ATR={volatility:.6f} SLOPE={slope_ratio:.8f} TREND={trend}")
 
-        # ========= POSITION =========
+        # ATR filter
+        if ENABLE_ATR_FILTER and not TEST_MODE and volatility < ATR_THRESHOLD:
+            print(f"{sym}: SIGNAL BLOCKED -> ATR={volatility:.6f} < TH={ATR_THRESHOLD}")
+            continue
+
+        # Slope filter
+        if ENABLE_SLOPE_FILTER and not TEST_MODE and slope_ratio < SLOPE_THRESHOLD:
+            print(f"{sym}: SIGNAL BLOCKED -> SLOPE={slope_ratio:.6f} < TH={SLOPE_THRESHOLD}")
+            continue
+
+        # Если сигнал прошёл
         side = "BUY" if trend=="UPTREND" else "SELL"
         entry = price
         tp = entry*(1+TP_PCT) if side=="BUY" else entry*(1-TP_PCT)
@@ -191,7 +189,6 @@ while True:
         print(f"TP={tp} SL={sl}")
         start = time.time()
 
-        # ========= MONITOR =========
         while True:
             current = get_price(sym)
             hit = (
