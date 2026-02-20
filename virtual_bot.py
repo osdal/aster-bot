@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 # ========= LOAD ENV =========
 load_dotenv(os.getenv("DOTENV_CONFIG_PATH", ".env"))
 
-
 BASE = os.getenv("ASTER_REST_BASE")
 SYMBOL = os.getenv("LIVE_SYMBOL", "XRPUSDT")
 NOTIONAL = float(os.getenv("LIVE_NOTIONAL_USD", "5"))
@@ -57,17 +56,27 @@ def log(msg):
     if VERBOSE:
         print(msg)
 
+
 def public_get(path):
-    return requests.get(BASE + path).json()
+    return requests.get(BASE + path, timeout=10).json()
+
 
 def get_price():
     ticker = public_get("/fapi/v1/ticker/price")
     return float([x for x in ticker if x["symbol"] == SYMBOL][0]["price"])
 
+
 def get_klines():
     return public_get(
         f"/fapi/v1/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit={KLINES_LIMIT}"
     )
+
+
+def get_last_candle():
+    k = public_get(
+        f"/fapi/v1/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit=2"
+    )
+    return k[-1]
 
 
 # ========= EMA =========
@@ -78,8 +87,10 @@ def ema(values, period):
     a[:period] = a[period]
     return a
 
+
 def ema_slope(series):
     return series[-1] - series[-SLOPE_LOOKBACK]
+
 
 def get_trend_and_slope():
     kl = get_klines()
@@ -126,6 +137,7 @@ if not os.path.exists(CSV_FILE):
             "duration_sec","r_multiple"
         ])
 
+
 def record_trade(side,entry,exit_price,result,pnl,equity,qty,
                  atr,vol_ratio,slope_ratio,tp,sl,start):
 
@@ -163,29 +175,22 @@ while True:
 
     if ENABLE_COOLDOWN and not TEST_MODE:
         if now-last_trade_time<COOLDOWN_SEC:
-            log("SKIP — cooldown")
             time.sleep(1)
             continue
 
     atr=get_atr()
     volatility=atr/price
 
-    log(f"ATR={atr:.6f} VOL={volatility:.6f} TH={ATR_THRESHOLD}")
-
     if ENABLE_ATR_FILTER and not TEST_MODE:
         if volatility<ATR_THRESHOLD:
-            log("SKIP — ATR filter")
             time.sleep(2)
             continue
 
     trend,slope=get_trend_and_slope()
     slope_ratio=abs(slope)/price
 
-    log(f"SLOPE={slope_ratio:.8f} TH={SLOPE_THRESHOLD}")
-
     if ENABLE_SLOPE_FILTER and not TEST_MODE:
         if slope_ratio<SLOPE_THRESHOLD:
-            log("SKIP — slope filter")
             time.sleep(2)
             continue
 
@@ -208,28 +213,39 @@ while True:
 
     start=time.time()
 
+    # ====== EXIT ENGINE (FIXED) ======
     while True:
-        current=get_price()
 
-        hit = (
-            current>=tp or current<=sl
-            if side=="BUY"
-            else current<=tp or current>=sl
-        )
+        candle = get_last_candle()
+        high = float(candle[2])
+        low = float(candle[3])
 
-        if hit:
-            exit_price=current
+        hit_tp = False
+        hit_sl = False
+
+        if side == "BUY":
+            if high >= tp:
+                hit_tp = True
+            if low <= sl:
+                hit_sl = True
+        else:
+            if low <= tp:
+                hit_tp = True
+            if high >= sl:
+                hit_sl = True
+
+        if hit_tp or hit_sl:
+
+            exit_price = tp if hit_tp else sl
+
             change=(exit_price-entry)/entry
-            pnl=change*qty*price
+            pnl=change*qty*entry
             if side=="SELL":
                 pnl*=-1
 
             equity+=pnl
 
-            result="TP" if (
-                (side=="BUY" and exit_price>=tp) or
-                (side=="SELL" and exit_price<=tp)
-            ) else "SL"
+            result="TP" if hit_tp else "SL"
 
             print(f"{result} | PnL={pnl:.4f} | EQUITY={equity:.2f}")
 
@@ -239,4 +255,4 @@ while True:
             last_trade_time=time.time()
             break
 
-        time.sleep(1)
+        time.sleep(2)

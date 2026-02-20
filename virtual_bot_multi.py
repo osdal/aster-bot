@@ -55,11 +55,17 @@ def log(msg):
         print(msg)
 
 def public_get(path):
-    return requests.get(BASE + path).json()
+    try:
+        return requests.get(BASE + path, timeout=5).json()
+    except:
+        return []
 
 def get_price(symbol):
     ticker = public_get("/fapi/v1/ticker/price")
-    return float([x for x in ticker if x["symbol"] == symbol][0]["price"])
+    for x in ticker:
+        if x["symbol"] == symbol:
+            return float(x["price"])
+    return None  # если тикер не найден
 
 def get_klines(symbol):
     return public_get(
@@ -117,7 +123,6 @@ if not os.path.exists(CSV_FILE):
 
 def record_trade(symbol, side, entry, exit_price, result, pnl, equity_val, qty,
                  atr, vol_ratio, slope_ratio, tp, sl, start):
-
     duration = int(time.time() - start)
     tp_dist = abs(tp-entry)/entry
     sl_dist = abs(sl-entry)/entry
@@ -147,13 +152,16 @@ while True:
 
     for sym in SYMBOLS:
         price = get_price(sym)
+        if price is None:
+            log(f"{sym}: price not available, skipping")
+            continue
+
         atr = get_atr(sym)
         volatility = atr/price
         trend, slope = get_trend_and_slope(sym)
         slope_ratio = abs(slope)/price
 
-        # Логируем все проверки
-        msg = f"{datetime.now()} | {sym}: PRICE={price:.2f}, ATR={atr:.6f}, VOL={volatility:.6f}, SLOPE={slope_ratio:.8f}, TREND={trend}"
+        msg = f"{datetime.now()} | {sym}: PRICE={price:.6f}, ATR={atr:.6f}, VOL={volatility:.6f}, SLOPE={slope_ratio:.8f}, TREND={trend}"
         print(msg)
 
         # Проверка cooldown
@@ -171,7 +179,6 @@ while True:
             print(f"{sym}: SIGNAL BLOCKED -> SLOPE={slope_ratio:.6f} < TH={SLOPE_THRESHOLD}")
             continue
 
-        # Если сигнал прошёл
         side = "BUY" if trend=="UPTREND" else "SELL"
         entry = price
         tp = entry*(1+TP_PCT) if side=="BUY" else entry*(1-TP_PCT)
@@ -185,17 +192,20 @@ while True:
         else:
             qty = math.floor((NOTIONAL/price)*10)/10
 
-        print(f"\n{sym} OPEN {side} {qty} @ {entry}")
-        print(f"TP={tp} SL={sl}")
+        print(f"\n{sym} OPEN {side} {qty} @ {entry} | TP={tp} SL={sl}")
         start = time.time()
 
+        last_hit_check_price = price
         while True:
             current = get_price(sym)
-            hit = (
-                current>=tp or current<=sl
-                if side=="BUY"
-                else current<=tp or current>=sl
-            )
+            if current is None:
+                time.sleep(1)
+                continue
+
+            # исправленный мониторинг: учитываем проскоченные цены
+            hit_tp = (side=="BUY" and current >= tp) or (side=="SELL" and current <= tp)
+            hit_sl = (side=="BUY" and current <= sl) or (side=="SELL" and current >= sl)
+            hit = hit_tp or hit_sl
 
             if hit:
                 exit_price = current
@@ -203,13 +213,9 @@ while True:
                 pnl = change*qty*price
                 if side=="SELL":
                     pnl*=-1
-
                 equity += pnl
 
-                result = "TP" if (
-                    (side=="BUY" and exit_price>=tp) or
-                    (side=="SELL" and exit_price<=tp)
-                ) else "SL"
+                result = "TP" if hit_tp else "SL"
 
                 print(f"{sym} {result} | PnL={pnl:.4f} | EQUITY={equity:.2f}")
                 record_trade(sym, side, entry, exit_price, result, pnl, equity,
@@ -217,4 +223,5 @@ while True:
                 last_trade_time[sym] = time.time()
                 break
 
+            last_hit_check_price = current
             time.sleep(1)

@@ -1,100 +1,195 @@
 import pandas as pd
-import os
+import numpy as np
+from pathlib import Path
 
-CSV_PATH = "data/trades.csv"
 
-if not os.path.exists(CSV_PATH):
-    print("Файл trades.csv не найден")
+TRADES_FILE = "data/trades_multi.csv"
+
+
+# ========= helpers =========
+
+def max_drawdown(equity):
+    peak = equity.iloc[0]
+    max_dd = 0.0
+
+    for val in equity:
+        if val > peak:
+            peak = val
+
+        dd = (peak - val) / peak
+        if dd > max_dd:
+            max_dd = dd
+
+    return max_dd
+
+
+def ascii_equity_plot(equity, width=70, height=18):
+    vals = equity.values
+    min_v = vals.min()
+    max_v = vals.max()
+
+    if max_v == min_v:
+        print("Flat equity")
+        return
+
+    scaled = (vals - min_v) / (max_v - min_v)
+    idx = np.linspace(0, len(vals)-1, width).astype(int)
+    sampled = scaled[idx]
+
+    canvas = [[" "]*width for _ in range(height)]
+
+    for x, v in enumerate(sampled):
+        y = height - 1 - int(v * (height-1))
+        canvas[y][x] = "█"
+
+    for row in canvas:
+        print("".join(row))
+
+
+def sl_streak_stats(group):
+    streak = 0
+    max_streak = 0
+    streaks = []
+
+    for r in group["result"]:
+        if r == "SL":
+            streak += 1
+        else:
+            if streak > 0:
+                streaks.append(streak)
+            max_streak = max(max_streak, streak)
+            streak = 0
+
+    if streak > 0:
+        streaks.append(streak)
+        max_streak = max(max_streak, streak)
+
+    avg_streak = np.mean(streaks) if streaks else 0
+    current = streak
+
+    return max_streak, current, avg_streak, len(streaks)
+
+
+# ========= load =========
+
+path = Path(TRADES_FILE)
+
+if not path.exists():
+    print(f"\nFILE NOT FOUND:\n{path.resolve()}\n")
     exit()
 
-# ========= LOAD =========
-df = pd.read_csv(CSV_PATH)
+df = pd.read_csv(path)
+df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-if len(df) == 0:
-    print("Нет сделок для анализа")
-    exit()
 
-print("\n========== GLOBAL STATS ==========")
+# ========= OVERALL =========
+
+print("\n================ OVERALL ================\n")
 
 total = len(df)
-wins = (df.result == "TP").sum()
-losses = (df.result == "SL").sum()
+wins = (df.pnl > 0).sum()
+loss = (df.pnl <= 0).sum()
 
-winrate = wins / total * 100
+winrate = wins / total if total else 0
 
 gross_profit = df[df.pnl > 0].pnl.sum()
-gross_loss = abs(df[df.pnl < 0].pnl.sum())
+gross_loss = abs(df[df.pnl <= 0].pnl.sum())
 
-profit_factor = gross_profit / gross_loss if gross_loss != 0 else 999
+profit_factor = gross_profit / gross_loss if gross_loss else np.inf
+expectancy = df.r_multiple.mean()
 
-avg_pnl = df.pnl.mean()
-median_pnl = df.pnl.median()
+print(f"Trades: {total}")
+print(f"Wins: {wins}")
+print(f"Loss: {loss}")
+print(f"Winrate: {winrate:.3f}")
+print(f"Profit factor: {profit_factor:.3f}")
+print(f"Expectancy (R): {expectancy:.3f}")
 
-avg_r = df.r_multiple.mean()
+equity = df.equity
+dd = max_drawdown(equity)
 
-avg_duration = df.duration_sec.mean()
+print(f"Max drawdown: {dd*100:.2f}%")
 
-start_equity = df.equity.iloc[0] - df.pnl.iloc[0]
-end_equity = df.equity.iloc[-1]
-net_profit = end_equity - start_equity
+print("\nEquity curve:\n")
+ascii_equity_plot(equity)
 
-max_equity = df.equity.cummax()
-drawdown = (df.equity - max_equity)
-max_dd = drawdown.min()
 
-expectancy = (
-    df[df.pnl > 0].pnl.mean() * (wins/total)
-    -
-    abs(df[df.pnl < 0].pnl.mean()) * (losses/total)
+# ========= DAILY =========
+
+print("\n============ DAILY STATS ============\n")
+
+df["day"] = df.timestamp.dt.date
+
+daily = df.groupby("day").agg(
+    trades=("pnl", "count"),
+    pnl=("pnl", "sum"),
+    avg_R=("r_multiple", "mean")
 )
 
-print(f"Total trades:        {total}")
-print(f"Wins / Losses:       {wins} / {losses}")
-print(f"Winrate:             {winrate:.2f}%")
-print()
-print(f"Net Profit:          {net_profit:.2f}")
-print(f"Profit Factor:       {profit_factor:.2f}")
-print(f"Expectancy/trade:    {expectancy:.4f}")
-print()
-print(f"Avg PnL:             {avg_pnl:.4f}")
-print(f"Median PnL:          {median_pnl:.4f}")
-print(f"Avg R multiple:      {avg_r:.3f}")
-print()
-print(f"Avg Duration (sec):  {avg_duration:.1f}")
-print(f"Max Drawdown:        {max_dd:.2f}")
+print(daily.to_string())
 
 
-# ========= PER SYMBOL =========
-print("\n========== BY SYMBOL ==========")
+# ========= BY SYMBOL + SL STREAK =========
 
-grouped = df.groupby("symbol")
+print("\n============ BY SYMBOL ============\n")
 
-for symbol, g in grouped:
+rows = []
 
-    t = len(g)
-    w = (g.result=="TP").sum()
-    wr = w/t*100
+for sym, g in df.groupby("symbol"):
+    trades = len(g)
+    wins = (g.pnl > 0).sum()
+    winrate = wins / trades if trades else 0
 
-    gp = g[g.pnl>0].pnl.sum()
-    gl = abs(g[g.pnl<0].pnl.sum())
+    gp = g[g.pnl > 0].pnl.sum()
+    gl = abs(g[g.pnl <= 0].pnl.sum())
 
-    pf = gp/gl if gl!=0 else 999
+    pf = gp / gl if gl else np.inf
+    exp = g.r_multiple.mean()
 
-    print(f"\n--- {symbol} ---")
-    print(f"Trades:        {t}")
-    print(f"Winrate:       {wr:.2f}%")
-    print(f"ProfitFactor:  {pf:.2f}")
-    print(f"Net:           {g.pnl.sum():.2f}")
+    max_sl, cur_sl, avg_sl, cnt_sl = sl_streak_stats(g)
+
+    rows.append([
+        sym,
+        trades,
+        winrate,
+        pf,
+        exp,
+        g.pnl.sum(),
+        max_sl,
+        cur_sl,
+        avg_sl,
+        cnt_sl
+    ])
+
+out = pd.DataFrame(
+    rows,
+    columns=[
+        "Symbol",
+        "Trades",
+        "Winrate",
+        "ProfitFactor",
+        "ExpectancyR",
+        "NetPnL",
+        "Max_SL_Streak",
+        "Current_SL_Streak",
+        "Avg_SL_Streak",
+        "SL_Streak_Count"
+    ]
+)
+
+print(out.sort_values("NetPnL", ascending=False).to_string(index=False))
 
 
-# ========= BEST / WORST =========
-best_trade = df.iloc[df.pnl.idxmax()]
-worst_trade = df.iloc[df.pnl.idxmin()]
+# ========= SIDE EDGE =========
 
-print("\n========== EXTREMES ==========")
+print("\n============ SIDE EDGE ============\n")
 
-print("\nBest trade:")
-print(best_trade)
+side = df.groupby("side").agg(
+    trades=("pnl", "count"),
+    pnl=("pnl", "sum"),
+    expectancy=("r_multiple", "mean")
+)
 
-print("\nWorst trade:")
-print(worst_trade)
+print(side.to_string())
+
+print("\nDone\n")
