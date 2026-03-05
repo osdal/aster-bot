@@ -1,0 +1,85 @@
+* [33m578c3d5[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mworking_multi_bot[m[33m, [m[1;31morigin/working_multi_bot[m[33m)[m Add multi-symbol virtual bot with fixed stop monitoring
+* [33m37f6aa1[m работающий мультисимвольный бот с логированием в консоль всех причин почему сделка не прошла
+* [33mcfa9459[m[33m ([m[1;32mmulti-bot-snapshot[m[33m)[m Initial working multi-symbol virtual bot with filters and logging
+* [33m6f8eb03[m[33m ([m[1;31morigin/multi-bot-snapshot[m[33m)[m snapshot multi virtual bot version
+* [33m4f144cf[m[33m ([m[1;31morigin/dev/virtual-bot[m[33m, [m[1;32mdev/virtual-bot[m[33m)[m multi-symbol env support + logging + analyzer
+* [33m4616ced[m Add trades analyzer
+* [33m86f08f0[m Add verbose logging + extended CSV metrics
+* [33m13a9ddf[m feat: add equity simulation with test mode
+* [33m813086b[m feat: add cooldown engine with env controls
+* [33m8d2e34e[m feat: add EMA slope filter with env toggle
+* [33mc80fc67[m Add ATR virtual trading bot
+* [33m7b6f74d[m Добавлен виртуальный бот с EMA трендом и CSV тренда
+* [33m0baf622[m Start virtual bot development
+[31m|[m * [33m5147f60[m[33m ([m[1;33mtag: [m[1;33mv1.0.0[m[33m, [m[1;31morigin/stable[m[33m, [m[1;32mstable[m[33m)[m Stable working version: dynamic qty, TP/SL, decimals per symbol
+[31m|[m[31m/[m  
+* [33m7853cac[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;32mmain[m[33m, [m[1;32mdev/new-multi-symbol-bot[m[33m)[m Working version: dynamic qty calculation, TP/SL auto, decimals per symbol
+* [33ma7fc790[m фикс
+* [33m8830174[m фикс
+* [33ma746b62[m фикс
+* [33m7e102d9[m фикс
+* [33m730fd1a[m фикс
+* [33m523d80f[m фикс
+* [33m6099ff0[m фикс
+* [33mc614728[m поехали заново
+* [33m54a1017[m фикс
+* [33ma6b64fa[m фиес
+* [33m13a4e78[m старые стопы
+* [33m89c9b7d[m мром
+* [33mbbd4c02[m ыыы
+* [33me502eeb[m фикс
+* [33m6300267[m фикс
+* [33m1616629[m фикс
+* [33mdcf198c[m фикч
+* [33m823e2c2[m фикс
+* [33mb0959dd[m ыыыы
+* [33m7e8a57b[m фивч
+* [33mdf68cd1[m фикс
+* [33me9a24e6[m фикс
+* [33m4adbfe9[m фикс
+* [33m6c80ab4[m уменьшение маржи
+* [33m86f009c[m фикс самотест
+* [33mf04a11e[m фикс
+* [33m5c07ed3[m фикс
+* [33m6d17452[m фикс
+* [33mbfc9829[m фикс
+* [33mef92656[m fix
+* [33mf9d8234[m фикс ошибки
+* [33m34f8b6d[m фикс времени
+* [33m837a02e[m то же
+* [33m46b5fde[m фикс очистка стопов
+* [33me34ee1f[m фикс обновления сделки
+* [33m91fc797[m фмкс стопов
+* [33m02e7a4c[m стопы на бирже
+* [33ma635cae[m фикс с реконнектом
+* [33m2831de9[m фикс с реконнект
+* [33m54e0378[m фикс
+* [33m6b826f9[m фикс
+* [33ma4fc6e5[m фикс переподключений
+* [33m5c1d6d7[m проверка на зависание
+* [33mbb9b218[m работает, но ночью зависает
+* [33mb765fc6[m новый фикс
+* [33m25802f2[m[33m ([m[1;33mtag: [m[1;33mзздесь-работает,-но-с-неюольшими-ошибками[m[33m)[m опять фикс
+* [33m4f3b032[m опять ремонт
+* [33m275e193[m опять фиес
+* [33m47d4bc3[m фикс с сохраненем логики
+* [33mc962f97[m кардинально изменил. останавливаем перебор, пока не закроется сделка после двух минусов
+* [33m7866393[m againe
+* [33m3abfc49[m againe
+* [33m9ecdb27[m againe
+* [33mbfa0826[m и опять
+* [33mc8e0d52[m кул довн
+* [33m4605581[m ремонт трех минусов
+* [33m6e0cc14[m и опять паузы
+* [33m763bb1b[m паузы опять
+* [33m47b15ac[m без пауз
+* [33mf996c31[m без пауз
+* [33mfb51abd[m три убытка подряд
+* [33mecc8ce0[m анализатор
+* [33m1fdfcec[m еше ремонт
+* [33m7395a9d[m еще ремонт
+* [33mbd85c34[m поправил временную зону
+* [33m60a40ba[m изменили стопы и тейки
+* [33mff2b318[m ремонт пнл
+* [33mfb8bf38[m работает на одну монету
+* [33m818fc0f[m Initial commit
